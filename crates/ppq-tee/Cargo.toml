@@ -8,6 +8,11 @@ description = "Attested, end-to-end encrypted in-process client for PPQ.AI TEE m
 [features]
 default = []
 rig = ["dep:rig-core"]
+# Exposes `ehbp::open::FrameSealer`, the EHBP *server* half of the response
+# AEAD. Off by default: a client build has no business sealing responses. It
+# lives beside the opener so the two derivations cannot drift apart, and is
+# available to anyone writing an EHBP server or integration harness.
+test-server = []
 
 [dependencies]
 thiserror = "2"
@@ -37,6 +42,15 @@ p384 = { version = "0.13", features = ["ecdsa"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 const-oid = { version = "0.9", default-features = false }
+# EHBP body encryption. All pure Rust (no OpenSSL). `aes` gives us AES-256-GCM
+# for the HPKE suite, `getrandom` the OS CSPRNG used to encapsulate.
+hpke = { version = "0.14", default-features = false, features = ["x25519", "alloc", "aes", "getrandom"] }
+# The response AEAD is derived by hand (HPKE export -> HKDF), so we need
+# AES-256-GCM and HKDF-SHA256 directly. `aes-gcm` is pinned to the same 0.11
+# line `hpke` uses, so exactly one AES-GCM implementation is compiled in.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 rig-core = { version = "0.41", optional = true }
 
 [dev-dependencies]
