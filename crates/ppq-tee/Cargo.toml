@@ -20,6 +20,16 @@ futures = "0.3"
 flate2 = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# Sigstore bundle verification. `sigstore` 0.14 can only verify an artifact it can
+# hash itself; we only ever hold the deployment's digest, so this crate family —
+# which takes a pre-computed digest — is the one that fits. See the Task 4 report.
+# `rustls` is not optional here: `reqwest` is an unconditional dependency of
+# sigstore-rekor/-tsa, so leaving the TLS backend unselected would fall back to
+# native-tls and pull in OpenSSL.
+sigstore-verify = { version = "0.11", default-features = false, features = ["rustls"] }
+sigstore-trust-root = { version = "0.11", default-features = false, features = ["rustls"] }
+sigstore-types = { version = "0.11", default-features = false }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
 rig-core = { version = "0.41", optional = true }
 
 [dev-dependencies]
