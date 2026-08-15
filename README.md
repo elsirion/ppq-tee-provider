@@ -12,10 +12,12 @@ that is HPKE-sealed inside your own process before it reaches the network.
 
 ## The guarantee
 
-PPQ's servers see ciphertext only. Every request body is sealed to a public
-key the client verifies belongs to a specific, currently-running enclave —
-not to PPQ's word for it. That verification chains through three independent
-layers:
+PPQ's servers see request and response **bodies** as ciphertext only. HTTP
+headers are not covered — the `Authorization` bearer token, the model id
+(`X-Private-Model`) and request timing stay visible to PPQ and to anything on
+the network path. What is sealed is every request body, to a public key the
+client verifies belongs to a specific, currently-running enclave — not to
+PPQ's word for it. That verification chains through three independent layers:
 
 1. A **sigstore DSSE build attestation** (Fulcio-issued certificate, logged
    in Rekor, signed by GitHub Actions in
@@ -106,6 +108,9 @@ rig-agent = "..."
 ```
 
 ```rust
+// `prompt` is a trait method, so the trait has to be in scope.
+use rig_agent::completion::Prompt;
+
 let agent = rig_agent::agent::AgentBuilder::new(
     ppq.completion_model("private/glm-5-2")?
 )
@@ -161,10 +166,21 @@ What is protected, and what is not:
   `TrustPolicy::max_attestation_age` (default 90 days) against the Rekor
   entry's `integratedTime`. This is inherent to Tinfoil's attestation
   design, not a defect in this crate.
+- **`attestation().domain` is server-reported, not attested.** It is echoed
+  verbatim from the attestation bundle's JSON and nothing binds it to the
+  enclave, so a malicious PPQ could serve a genuine attestation for a real
+  Tinfoil enclave under any domain string it liked. Confidentiality does not
+  depend on it — bodies are sealed to the *attested* HPKE key — but it is not
+  evidence of which deployment answered. Binding it would mean checking the
+  SHA-256 of the `enclaveCert` SubjectPublicKeyInfo against the report's
+  `tls_key_fingerprint`, then that certificate's SAN against `domain`;
+  neither check is implemented.
 - **AMD certificate validity periods are not checked.** Documented on
-  `verify_chain`: AMD's ARKs run to 2047, VCEKs are not revoked or rotated
-  per-boot, and AMD's CRL endpoint is not consulted. An expiry check would
-  add no security here while making a committed test fixture rot.
+  `verify_chain`: AMD's ARKs run to 2047 and VCEKs are not revoked or rotated
+  per-boot, so an expiry check would add no security here while making a
+  committed test fixture rot. Separately — and not covered by that doc block
+  — AMD's CRL endpoint is never consulted; this crate makes no revocation
+  query at all.
 - **Turin (AMD family 1Ah) attestations are refused outright.** The
   `TCB_VERSION` field layout differs from Milan/Genoa (family 19h) in a way
   this crate does not know how to parse, and it will not guess.

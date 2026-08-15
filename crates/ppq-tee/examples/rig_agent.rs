@@ -11,6 +11,8 @@
 //! lines:
 //!
 //! ```ignore
+//! use rig_agent::completion::Prompt; // `prompt` is a trait method
+//!
 //! let agent = rig_agent::agent::AgentBuilder::new(ppq.completion_model("private/glm-5-2")?)
 //!     .preamble("You are concise.")
 //!     .build();
@@ -29,10 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
+    // The measurement is what the hardware actually attested. `domain` is only
+    // echoed from the attestation bundle — see `Attestation::domain` — so it is
+    // labelled as reported, not presented as a verification result.
     println!(
-        "attested enclave {}, measurement {}",
-        ppq.attestation().domain,
+        "attested measurement {} (server-reported domain: {})",
         hex::encode(&ppq.attestation().measurement[..8]),
+        ppq.attestation().domain,
     );
 
     let model = ppq.completion_model("private/glm-5-2")?;

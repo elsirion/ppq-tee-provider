@@ -301,13 +301,26 @@ pub type PpqCompletionModel = GenericCompletionModel<PpqExt, EhbpHttp>;
 `Arc<HeaderMap>` applied to outgoing requests, so the per-model header is set
 declaratively — no inspecting request bodies to recover the model name.
 
-Usage:
+Usage. `completion_model` returns `Result<PpqCompletionModel>`: it validates the model
+id before it reaches a header (see §6), so it can fail.
 
 ```rust
 let ppq = PpqClient::builder().api_key(key).build().await?;   // attests here
-let agent = rig::agent::AgentBuilder::new(
-    ppq.completion_model("private/glm-5-2")
+let model = ppq.completion_model("private/glm-5-2")?;
+```
+
+`rig-core` 0.41 has no `agent` module — `Agent`/`AgentBuilder` live in the
+separate `rig-agent` crate, which `ppq-tee` does not depend on. Since
+`PpqCompletionModel` implements `rig_core::completion::CompletionModel`,
+wrapping it in an agent is one dependency away:
+
+```rust
+use rig_agent::completion::Prompt;  // `prompt` is a trait method
+
+let agent = rig_agent::agent::AgentBuilder::new(
+    ppq.completion_model("private/glm-5-2")?
 ).build();
+println!("{}", agent.prompt("Name three prime numbers.").await?);
 ```
 
 Core additionally exposes a rig-free escape hatch:

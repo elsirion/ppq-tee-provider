@@ -28,6 +28,11 @@ async fn client() -> PpqClient {
 #[ignore]
 async fn attests_the_live_enclave() {
     let c = client().await;
+    // The attestation check is `client()` itself: `build()` returns `Err`
+    // unless the hardware report chained to AMD and matched the signed build
+    // attestation. `domain` is *not* part of that — it is echoed verbatim from
+    // the bundle JSON (see `Attestation::domain`), so this is a smoke check
+    // that we reached the deployment we expected, not an attestation check.
     assert_eq!(c.attestation().domain, "inference.tinfoil.sh");
     assert_ne!(c.attestation().hpke_public_key, [0u8; 32]);
 }

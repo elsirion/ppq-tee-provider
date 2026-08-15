@@ -52,9 +52,14 @@ pub struct VcekKey(pub(crate) VerifyingKey);
 /// Certificate validity periods are deliberately not checked. AMD's ARKs run
 /// to 2047 and VCEKs are not revoked or rotated per-boot, so an expiry check
 /// would add no security here while making a committed test fixture rot.
-/// Freshness of the *deployment* is established by the sigstore layer's
-/// `max_attestation_age`, and freshness of the *session* by the nonce bound
-/// into `report_data`.
+///
+/// Do not read that as licence to relax freshness anywhere else. There is no
+/// client-supplied nonce anywhere in this protocol: `report_data` carries the
+/// enclave's own TLS key fingerprint and HPKE public key, nothing the verifier
+/// chose, so a *replayed genuine* report still verifies as genuine and nothing
+/// here binds an attestation to this session. The only freshness bound that
+/// exists is the sigstore layer's `TrustPolicy::max_attestation_age`, applied
+/// to the Rekor entry's `integratedTime`. It is load-bearing on its own.
 pub fn verify_chain(vcek_der: &[u8], product: AmdProduct) -> Result<VcekKey> {
     let vcek = Certificate::from_der(vcek_der)
         .map_err(|e| Error::Attestation(format!("VCEK is not a DER certificate: {e}")))?;
