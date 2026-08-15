@@ -75,7 +75,20 @@ pub fn verify_chain(vcek_der: &[u8], product: AmdProduct) -> Result<VcekKey> {
     verify_signed_by(ask, ark)?;
     verify_signed_by(&vcek, ask)?;
 
-    let spki = &vcek.tbs_certificate.subject_public_key_info;
+    let key = p384_key_from_spki(&vcek.tbs_certificate.subject_public_key_info)?;
+    Ok(VcekKey(key))
+}
+
+/// Check that `spki` names the id-ecPublicKey algorithm on curve secp384r1 —
+/// the only key type and curve AMD issues for a VCEK — and extract the key.
+///
+/// Split out from [`verify_chain`] so this fail-closed logic can be exercised
+/// directly in tests: `spki` lives inside a certificate's signed
+/// `tbsCertificate`, so a DER fixture with a tampered curve OID no longer
+/// carries a valid CA signature, and driving such a fixture through the full
+/// chain would be rejected by the signature check instead — for the wrong
+/// reason.
+fn p384_key_from_spki(spki: &x509_cert::spki::SubjectPublicKeyInfoOwned) -> Result<VerifyingKey> {
     if spki.algorithm.oid != ID_EC_PUBLIC_KEY {
         return Err(Error::Attestation(format!(
             "VCEK key algorithm is {}, want id-ecPublicKey",
@@ -95,14 +108,12 @@ pub fn verify_chain(vcek_der: &[u8], product: AmdProduct) -> Result<VcekKey> {
         )));
     }
 
-    let key = VerifyingKey::from_sec1_bytes(
+    VerifyingKey::from_sec1_bytes(
         spki.subject_public_key
             .as_bytes()
             .ok_or_else(|| Error::Attestation("VCEK public key is not aligned".into()))?,
     )
-    .map_err(|e| Error::Attestation(format!("VCEK public key is not P-384: {e}")))?;
-
-    Ok(VcekKey(key))
+    .map_err(|e| Error::Attestation(format!("VCEK public key is not P-384: {e}")))
 }
 
 /// Check that `cert` names `issuer` as its issuer and that its signature
@@ -142,6 +153,17 @@ fn verify_signed_by(cert: &Certificate, issuer: &Certificate) -> Result<()> {
             "unsupported certificate signature algorithm {}",
             algorithm.oid
         )));
+    }
+    // RFC 5280 §6.1 requires the outer, unsigned `signatureAlgorithm` to
+    // equal the inner one in the signed `tbsCertificate.signature` field. A
+    // mismatch would mean a verifier and a signer could each read a different
+    // algorithm out of the same certificate.
+    if *algorithm != cert.tbs_certificate.signature {
+        return Err(Error::Attestation(
+            "certificate's outer signatureAlgorithm does not match the signed \
+             tbsCertificate.signature"
+                .into(),
+        ));
     }
 
     // Verify under the parameters the certificate itself declares, so a
@@ -204,9 +226,89 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../../../testdata/attestation-bundle.json");
 
+    /// Overwrite the content bytes (not the tag/length) of the *last* DER TLV
+    /// encoding of `target` found in `der` with `replacement`'s own content
+    /// bytes.
+    ///
+    /// The last occurrence is used deliberately: within a `Certificate`'s DER
+    /// a repeated `AlgorithmIdentifier` OID occurs first inside the signed
+    /// `tbsCertificate` and again in the outer, unsigned
+    /// `signatureAlgorithm` field, so "last" reliably means "outer" — the one
+    /// `verify_signed_by` checks and that isn't covered by the CA's
+    /// signature. `target` and `replacement` must have equal-length DER
+    /// content so no length octet in the enclosing structure has to move.
+    fn replace_last_oid(der: &mut [u8], target: ObjectIdentifier, replacement: ObjectIdentifier) {
+        use x509_cert::der::Encode;
+        let target_tlv = target.to_der().unwrap();
+        let replacement_content = replacement.as_bytes();
+        assert_eq!(
+            target.as_bytes().len(),
+            replacement_content.len(),
+            "swap requires equal-length OID content"
+        );
+        let pos = der
+            .windows(target_tlv.len())
+            .rposition(|w| w == target_tlv.as_slice())
+            .expect("target OID TLV present in the fixture DER");
+        // TLV = 1 tag octet + 1 short-form length octet + content.
+        let content_start = pos + 2;
+        der[content_start..content_start + replacement_content.len()]
+            .copy_from_slice(replacement_content);
+    }
+
     #[test]
     fn rejects_a_garbage_certificate() {
         assert!(verify_chain(&[0u8; 16], AmdProduct::Milan).is_err());
+    }
+
+    /// The outer `signatureAlgorithm` is not covered by the CA's signature
+    /// over `tbsCertificate` (it's a sibling field), so it can be mutated in
+    /// place without invalidating the certificate's signature — letting this
+    /// exercise `verify_signed_by`'s algorithm-OID check specifically, rather
+    /// than incidentally failing the signature check for an unrelated
+    /// reason.
+    #[test]
+    fn rejects_a_vcek_whose_outer_signature_algorithm_is_not_rsassa_pss() {
+        let b = bundle::parse(FIXTURE).unwrap();
+        let mut der = STANDARD.decode(&b.vcek).unwrap();
+        // id-mgf1 has the same 9-byte DER content length as id-RSASSA-PSS,
+        // so the swap needs no length fixup, and it is a real PKCS#1 OID
+        // that is definitely not RSASSA-PSS.
+        replace_last_oid(&mut der, ID_RSASSA_PSS, ID_MGF1);
+        let err = verify_chain(&der, AmdProduct::Genoa).expect_err("must not verify");
+        assert!(
+            err.to_string()
+                .contains("unsupported certificate signature algorithm"),
+            "must fail on the algorithm OID, not incidentally: {err}"
+        );
+    }
+
+    /// Unlike the outer `signatureAlgorithm`, the SPKI (and its curve OID)
+    /// lives inside the signed `tbsCertificate` — mutating it invalidates the
+    /// ASK's signature over the VCEK, so driving a mutated fixture through
+    /// `verify_chain` would be rejected by the signature check first, for an
+    /// unrelated reason. `p384_key_from_spki` is exercised directly instead,
+    /// on the real fixture VCEK's (parsed, mutated) SPKI, so the actual
+    /// curve-check code path used by `verify_chain` is what's under test.
+    #[test]
+    fn rejects_a_vcek_whose_spki_curve_is_not_secp384r1() {
+        use x509_cert::der::Decode;
+
+        let b = bundle::parse(FIXTURE).unwrap();
+        let mut der = STANDARD.decode(&b.vcek).unwrap();
+        // secp256k1 (1.3.132.0.10) has the same 5-byte DER content length as
+        // secp384r1 (1.3.132.0.34) — both are "1.3.132.0.<arc>" — and is a
+        // real, different curve OID.
+        const ID_SECP256K1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.132.0.10");
+        replace_last_oid(&mut der, ID_SECP384R1, ID_SECP256K1);
+
+        let cert = Certificate::from_der(&der).expect("still structurally valid DER");
+        let err = p384_key_from_spki(&cert.tbs_certificate.subject_public_key_info)
+            .expect_err("must not accept a non-secp384r1 curve");
+        assert!(
+            err.to_string().contains("secp384r1"),
+            "must fail on the curve, not incidentally: {err}"
+        );
     }
 
     #[test]
@@ -240,7 +342,11 @@ mod tests {
         let b = bundle::parse(FIXTURE).unwrap();
         let mut der = STANDARD.decode(&b.vcek).unwrap();
         der.push(0);
-        assert!(verify_chain(&der, AmdProduct::Genoa).is_err());
+        let err = verify_chain(&der, AmdProduct::Genoa).expect_err("must not verify");
+        assert!(
+            err.to_string().contains("trailing data"),
+            "must fail on the trailing bytes, not incidentally: {err}"
+        );
     }
 
     #[test]
