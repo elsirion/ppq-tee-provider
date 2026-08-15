@@ -92,9 +92,11 @@ step fails closed; there is no "warn and continue" path.
    - Build the Fulcio certificate chain against an **embedded** sigstore trusted
      root (checked into the repo, overridable via `TrustPolicy`). Runtime TUF
      refresh is deliberately out of scope.
-   - Assert the certificate's identity: SAN URI matching
-     `https://github.com/tinfoilsh/confidential-model-router/.github/workflows/tinfoil-release-publish.yml@refs/tags/*`
-     and OIDC issuer `https://token.actions.githubusercontent.com`.
+   - Assert the certificate's identity via its GitHub Actions X.509 extensions:
+     `GitHubWorkflowRepository == tinfoilsh/confidential-model-router` (OID
+     1.3.6.1.4.1.57264.1.5) and `OIDCIssuer ==
+     https://token.actions.githubusercontent.com` (OID 1.3.6.1.4.1.57264.1.1),
+     combined with `AllOf`. See §4.4 for why this is not pinned on the SAN.
    - Verify the Rekor entry: signed entry timestamp against the log key from the
      trusted root, inclusion proof to the checkpoint root hash, checkpoint
      signature, and that `canonicalizedBody` hashes to the DSSE envelope.
@@ -123,23 +125,49 @@ Fulcio certificates are valid for ten minutes. The live bundle captured on
 valid.
 
 Certificate validity is therefore checked against the Rekor entry's
-`integratedTime`, per standard sigstore practice — never against `now()`. The
-verification time is an explicit parameter of `verify_bundle`, which is also
-what makes the fixture-based test suite possible.
+`integratedTime`, per standard sigstore practice — never against `now()`.
+
+The `sigstore` crate already does exactly this internally
+(`bundle/verify/verifier.rs` compares the cert's `not_before`/`not_after`
+against `log_entry.integrated_time`), so no clock needs threading through that
+layer. The useful consequence is that a captured fixture verifies
+deterministically forever, rather than going stale ten minutes after capture.
+
+Verification is run with the crate's `offline` mode so no Rekor round-trip is
+needed; the bundle's own inclusion proof is the evidence.
 
 ### 4.3 Trust policy
 
 ```rust
 pub struct TrustPolicy {
-    pub sigstore_trusted_root: TrustedRoot,   // embedded default
-    pub certificate_identity: CertIdentity,   // SAN URI pattern + OIDC issuer
-    pub amd_roots: Vec<Certificate>,          // embedded Milan/Genoa/Turin
-    pub require_debug_disabled: bool,         // default true
+    pub sigstore_trusted_root: ManualTrustRoot<'static>, // embedded default
+    pub signer_repository: String,   // "tinfoilsh/confidential-model-router"
+    pub oidc_issuer: String,         // "https://token.actions.githubusercontent.com"
+    pub amd_roots: Vec<Certificate>, // embedded Milan/Genoa/Turin
+    pub require_debug_disabled: bool,// default true
 }
 ```
 
 Defaults encode the values above. Callers pinning a different Tinfoil deployment
-override `certificate_identity`.
+override `signer_repository`.
+
+### 4.4 Pin the repository, not the SAN
+
+The obvious anchor is the certificate's SAN URI, but the live value is
+
+```
+https://github.com/tinfoilsh/confidential-model-router/.github/workflows/tinfoil-release-publish.yml@refs/tags/v0.0.141
+```
+
+— it embeds the **release tag**, and `sigstore`'s `Identity` policy matches the
+SAN by exact string. Pinning it would make verification fail on every Tinfoil
+release until this crate shipped a new constant.
+
+Pinning `GitHubWorkflowRepository` + `OIDCIssuer` instead gives the same trust
+anchor — only that repository's GitHub Actions can produce a passing bundle —
+while surviving routine releases. The workflow ref is deliberately *not* pinned;
+if that granularity is ever wanted, `GitHubWorkflowRef` can be added to the
+`AllOf` at the cost of a constant bump per release.
 
 ## 5. EHBP transport
 
@@ -303,18 +331,19 @@ cannot borrow `&self` into the returned future. `EhbpHttp` holds its state in an
 Pinned fixtures plus an injectable clock, with live tests gated behind
 `#[ignore]`.
 
-**Fixtures.** `testdata/` holds a captured attestation bundle and key config,
-verified against a frozen `integratedTime`. `cargo xtask capture-fixtures`
-refreshes them when PPQ redeploys.
+**Fixtures.** `testdata/` holds a captured attestation bundle and key config.
+Because the sigstore layer anchors on the bundle's own `integratedTime` (§4.2),
+these verify deterministically and offline with no clock injection.
+`cargo xtask capture-fixtures` refreshes them when PPQ redeploys.
 
 **Negative attestation tests** — each must be rejected:
 
 - flipped byte in the SNP measurement
 - corrupted DSSE signature
-- `TrustPolicy` naming a different repo or workflow
+- `TrustPolicy` naming a different `signer_repository`
 - truncated SNP report
 - substituted VCEK certificate
-- certificate expired relative to the Rekor `integratedTime`
+- tampered Rekor inclusion proof
 
 **EHBP tests.** Round-trip against an in-process server implementing the server
 half of EHBP. This is also what pins down the chunk framing and the `base XOR i`
@@ -336,11 +365,14 @@ is `rustls` throughout, so **no OpenSSL** in the shell or the dependency tree.
 
 ## 11. Risks
 
-- **The `sigstore` 0.14 crate is the main unknown.** Its bundle-verification API
-  may not cleanly accept a caller-supplied verification time (§4.2) together with
-  a custom certificate identity policy. Fallback is hand-rolling that layer on
-  `x509-cert`, `p384`/`p256`, `sha2` and `rustls-webpki` — every piece exists, but
-  this is the one place the estimate can move materially.
+- ~~The `sigstore` 0.14 crate is the main unknown.~~ **Resolved during
+  planning.** The crate fits: `bundle::verify::Verifier` handles DSSE bundles
+  natively (signing over PAE bytes), checks cert expiry against Rekor's
+  `integrated_time` (§4.2), supports `offline` verification, exposes
+  `ManualTrustRoot` for an embedded root with no TUF fetch, and provides
+  `GitHubWorkflowRepository` / `OIDCIssuer` / `AllOf` policies (§4.3). Use it
+  with `default-features = false` plus `bundle`, `sigstore-trust-root` and
+  `rustls-tls` to keep OpenSSL out (§10).
 - AMD ARK/ASK roots must be embedded per product line (Milan, Genoa, Turin) and
   selected from the report's CPU family. The VCEK ships inside the bundle, so no
   AMD KDS round-trip is needed at verification time.
