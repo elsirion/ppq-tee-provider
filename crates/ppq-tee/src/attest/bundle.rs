@@ -30,15 +30,37 @@ pub fn parse(json: &str) -> Result<AttestationBundle> {
     Ok(serde_json::from_str(json)?)
 }
 
+/// Size in bytes of a raw SEV-SNP attestation report (always exactly 0x4A0).
+const SNP_REPORT_SIZE: u64 = 0x4A0;
+
 /// Base64-decode then gunzip the report body.
+///
+/// The gzip stream is decompressed under a byte cap (`SNP_REPORT_SIZE` plus a small margin)
+/// so that an attacker-supplied bundle cannot use a small gzip payload to inflate to an
+/// unbounded size before verification has had a chance to reject it. A stream that would
+/// decompress to more than the cap is rejected outright rather than silently truncated,
+/// since a truncated-but-cap-sized buffer could otherwise slip past the length check in
+/// `attest::snp::report::parse`.
 pub fn decode_report_body(body: &str) -> Result<Vec<u8>> {
     let gz = STANDARD
         .decode(body)
         .map_err(|e| Error::Attestation(format!("report body is not base64: {e}")))?;
+
+    // Allow one extra byte beyond the expected size: if we can still read that extra byte,
+    // the stream is longer than expected and we reject it, instead of silently truncating.
+    let limit = SNP_REPORT_SIZE + 1;
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(&gz[..])
+        .take(limit)
         .read_to_end(&mut out)
         .map_err(|e| Error::Attestation(format!("report body is not gzip: {e}")))?;
+
+    if out.len() as u64 > SNP_REPORT_SIZE {
+        return Err(Error::Attestation(format!(
+            "report body decompressed to more than {SNP_REPORT_SIZE} bytes"
+        )));
+    }
+
     Ok(out)
 }
 
@@ -78,7 +100,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_report_body() {
+    fn rejects_non_base64_report_body() {
         assert!(decode_report_body("not-base64!!").is_err());
+    }
+
+    #[test]
+    fn rejects_valid_base64_that_is_not_gzip() {
+        // Valid base64, but the decoded bytes are not a gzip stream at all.
+        let body = STANDARD.encode(b"this is definitely not a gzip stream");
+        assert!(decode_report_body(&body).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_decompressed_report_body() {
+        use std::io::Write;
+
+        // Gzip-compress a run of zero bytes well over the expected report size, so that
+        // decompression would otherwise inflate far past `SNP_REPORT_SIZE`.
+        let big = vec![0u8; 10 * (SNP_REPORT_SIZE as usize)];
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&big).expect("gzip encode succeeds");
+        let gz = encoder.finish().expect("gzip finish succeeds");
+
+        let body = STANDARD.encode(gz);
+        assert!(decode_report_body(&body).is_err());
     }
 }
