@@ -26,7 +26,7 @@ const MAX_ERROR_BODY_BYTES: usize = 4096;
 
 /// Truncate `body` to `MAX_ERROR_BODY_BYTES`, noting it in the string when it
 /// happens, so nothing downstream mistakes the cut text for the whole body.
-fn cap_body(mut body: String) -> String {
+pub(crate) fn cap_body(mut body: String) -> String {
     if body.len() <= MAX_ERROR_BODY_BYTES {
         return body;
     }
@@ -129,82 +129,24 @@ impl PpqClient {
     /// never carried an `Ehbp-Response-Nonce` become `Error::UnauthenticatedUpstream`.
     pub async fn chat_completion(&self, mut body: serde_json::Value) -> Result<serde_json::Value> {
         let model = self.take_model(&mut body)?;
-        let (mut decoder, response) = self.send_sealed(&body, &model).await?;
-        let status = response.status();
-        let mut out = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            out.extend(decoder.push(&chunk?)?);
-        }
-        decoder.finish()?;
-        if !status.is_success() {
-            return Err(Error::Enclave {
-                status: status.as_u16(),
-                body: cap_body(String::from_utf8_lossy(&out).into_owned()),
-            });
-        }
-        Ok(serde_json::from_slice(&out)?)
+        let (decoder, response) = self.send_sealed(&body, &model).await?;
+        Ok(serde_json::from_slice(
+            &open_body(decoder, response).await?,
+        )?)
     }
 
     /// Stream one OpenAI-format chat completion; yields decrypted SSE bytes.
     ///
-    /// A sealed non-2xx never produces a stream: the status is checked
-    /// against the response headers before any stream is built, and a
-    /// failure is returned as `Err(Error::Enclave)` from this function
-    /// instead. The alternative — yielding the decrypted error body as a
-    /// stream item — would hand a consumer expecting SSE a single chunk of
-    /// error JSON with no signal that it isn't a completion; checking the
-    /// status upfront lets the error surface through the same `?` a caller
-    /// already uses for every other failure mode here, rather than requiring
-    /// stream consumers to separately inspect each item for an error shape.
-    ///
-    /// On the 2xx path, the stream ends after its first error: the decoder is
-    /// poisoned by any failure, so continuing past one could only produce
-    /// more errors. A transport EOF that leaves a partial frame is itself an
-    /// error — the final item — so a truncated stream can never be mistaken
-    /// for a complete one.
+    /// See [`open_stream`] for how a sealed non-2xx and a truncated stream are
+    /// handled — neither can be mistaken for a completed one.
     pub async fn chat_completion_stream(
         &self,
         mut body: serde_json::Value,
     ) -> Result<impl Stream<Item = Result<Bytes>>> {
         let model = self.take_model(&mut body)?;
         body["stream"] = serde_json::Value::Bool(true);
-        let (mut decoder, response) = self.send_sealed(&body, &model).await?;
-        let status = response.status();
-        let mut inner = response.bytes_stream();
-
-        if !status.is_success() {
-            let mut out = Vec::new();
-            while let Some(chunk) = inner.next().await {
-                out.extend(decoder.push(&chunk?)?);
-            }
-            decoder.finish()?;
-            return Err(Error::Enclave {
-                status: status.as_u16(),
-                body: cap_body(String::from_utf8_lossy(&out).into_owned()),
-            });
-        }
-
-        let stream = futures::stream::unfold(Some((decoder, inner)), |state| async move {
-            let (mut decoder, mut inner) = state?;
-            match inner.next().await {
-                Some(Ok(chunk)) => match decoder.push(&chunk) {
-                    Ok(plain) => Some((Ok(Bytes::from(plain)), Some((decoder, inner)))),
-                    Err(e) => Some((Err(e), None)),
-                },
-                Some(Err(e)) => Some((Err(Error::Http(e)), None)),
-                // Transport EOF: only a clean frame boundary ends the
-                // stream successfully.
-                None => match decoder.finish() {
-                    Ok(()) => None,
-                    Err(e) => Some((Err(e), None)),
-                },
-            }
-        });
-
-        // A transport chunk that completes no frame yields no plaintext;
-        // don't surface those as empty items.
-        Ok(stream.try_filter(|plain| futures::future::ready(!plain.is_empty())))
+        let (decoder, response) = self.send_sealed(&body, &model).await?;
+        open_stream(decoder, response).await
     }
 
     /// Rewrite `model` to the enclave-internal id and return the user-facing one.
@@ -229,62 +171,211 @@ impl PpqClient {
         body: &serde_json::Value,
         model: &str,
     ) -> Result<(FrameDecoder, reqwest::Response)> {
-        let plaintext = serde_json::to_vec(body)?;
-        let sealed = seal::seal(&self.attestation.hpke_public_key, &plaintext)?;
-
-        // EHBP requires chunked transfer encoding with no `Content-Length`.
-        // `.body(Vec<u8>)` sets `Content-Length` and sends no
-        // `Transfer-Encoding` — see
-        // `sends_the_sealed_body_chunked_without_a_content_length` — so the
-        // body goes out as a single-item stream instead, which makes `reqwest`
-        // frame it as chunked. (Measured 2026-08-15: the live enclave happens
-        // to accept a `Content-Length` body as well, but the spec is explicit
-        // and a streaming request body could not carry one anyway.)
-        let one_chunk =
-            futures::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(sealed.body))]);
-        let sealed_body = reqwest::Body::wrap_stream(one_chunk);
-
-        let response = self
-            .http
-            .post(format!("{}/private/v1/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .header("Content-Type", "application/json")
-            .header("Ehbp-Encapsulated-Key", hex::encode(sealed.enc))
-            .header("X-Private-Model", model)
-            .header("x-query-source", "api")
-            .body(sealed_body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        let nonce_hex = response
-            .headers()
-            .get("ehbp-response-nonce")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let Some(nonce_hex) = nonce_hex else {
-            // Missing nonce on 2xx is a body-substitution attack surface: an
-            // on-path attacker strips the header and supplies plaintext. Fail
-            // closed. On non-2xx it usually means an intermediary rejected the
-            // request before the enclave saw it — surface it as explicitly
-            // unauthenticated so callers cannot mistake it for enclave output.
-            let body = response.text().await.unwrap_or_default();
-            return Err(if status.is_success() {
-                Error::Ehbp("2xx response without Ehbp-Response-Nonce".into())
-            } else {
-                Error::UnauthenticatedUpstream {
-                    status: status.as_u16(),
-                    body: cap_body(body),
-                }
-            });
-        };
-
-        let nonce = hex::decode(&nonce_hex)
-            .map_err(|e| Error::Ehbp(format!("response nonce is not hex: {e}")))?;
-        let opener: FrameOpener = sealed.session.opener(&nonce)?;
-        Ok((FrameDecoder::new(opener), response))
+        seal_and_send(
+            self,
+            &format!("{}{}", self.base_url, CHAT_COMPLETIONS_PATH),
+            &serde_json::to_vec(body)?,
+            routing_headers(model)?,
+        )
+        .await
     }
+}
+
+/// The enclave's chat-completions endpoint, relative to the base URL. The
+/// `rig` transport reaches the same URL by way of rig's own routing, so this
+/// constant is what the two paths are checked against each other on.
+pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/private/v1/chat/completions";
+
+/// The two non-EHBP headers the enclave's front end routes on: which model to
+/// dispatch to (user-facing id, `private/` prefix intact) and where the query
+/// came from.
+pub(crate) fn routing_headers(model: &str) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-private-model",
+        reqwest::header::HeaderValue::from_str(model)
+            .map_err(|_| Error::InvalidModelId(model.to_string()))?,
+    );
+    headers.insert(
+        "x-query-source",
+        reqwest::header::HeaderValue::from_static("api"),
+    );
+    Ok(headers)
+}
+
+/// Seal `plaintext` to the attested enclave key and POST it to `url`.
+///
+/// The single place a request body is encrypted. Both `PpqClient`'s JSON API
+/// and the `rig` transport go through here, so the two cannot drift on
+/// sealing, on the chunked framing EHBP requires, or on any of the fail-closed
+/// checks that decide whether a response is enclave output at all.
+///
+/// `extra_headers` carries whatever the caller needs to route the request; the
+/// auth, content-type and EHBP headers are then `insert`ed over it, so a
+/// caller can never displace them — and, just as importantly, can never end up
+/// sending a second copy of one alongside ours.
+pub(crate) async fn seal_and_send(
+    client: &PpqClient,
+    url: &str,
+    plaintext: &[u8],
+    mut headers: reqwest::header::HeaderMap,
+) -> Result<(FrameDecoder, reqwest::Response)> {
+    // The bearer token and the sealed body only ever go to the origin we
+    // attested. `starts_with` on the bare base URL would also accept
+    // `https://api.ppq.ai.example.com/...`, so the boundary has to be a path
+    // separator.
+    let base = client.base_url.trim_end_matches('/');
+    if !url.starts_with(base) || !url[base.len()..].starts_with('/') {
+        return Err(Error::Ehbp(format!(
+            "refusing to seal a request to {url}, which is outside the attested origin {base}"
+        )));
+    }
+
+    let sealed = seal::seal(&client.attestation.hpke_public_key, plaintext)?;
+
+    // EHBP requires chunked transfer encoding with no `Content-Length`.
+    // `.body(Vec<u8>)` sets `Content-Length` and sends no `Transfer-Encoding`
+    // — see `sends_the_sealed_body_chunked_without_a_content_length` — so the
+    // body goes out as a single-item stream instead, which makes `reqwest`
+    // frame it as chunked. (Measured 2026-08-15: the live enclave happens to
+    // accept a `Content-Length` body as well, but the spec is explicit and a
+    // streaming request body could not carry one anyway.)
+    let one_chunk = futures::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(sealed.body))]);
+    let sealed_body = reqwest::Body::wrap_stream(one_chunk);
+
+    // `insert`, not `RequestBuilder::header` — that one *appends*, so a caller
+    // who already set `Content-Type` (rig's client does) would put two of them
+    // on the wire.
+    let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", client.api_key))
+        .map_err(|_| Error::Attestation("API key is not a valid header value".into()))?;
+    bearer.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, bearer);
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        "ehbp-encapsulated-key",
+        reqwest::header::HeaderValue::from_str(&hex::encode(sealed.enc))
+            .expect("hex is a valid header value"),
+    );
+
+    let response = client
+        .http
+        .post(url)
+        .headers(headers)
+        .body(sealed_body)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let nonce_hex = response
+        .headers()
+        .get("ehbp-response-nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let Some(nonce_hex) = nonce_hex else {
+        // Missing nonce on 2xx is a body-substitution attack surface: an
+        // on-path attacker strips the header and supplies plaintext. Fail
+        // closed. On non-2xx it usually means an intermediary rejected the
+        // request before the enclave saw it — surface it as explicitly
+        // unauthenticated so callers cannot mistake it for enclave output.
+        let body = response.text().await.unwrap_or_default();
+        return Err(if status.is_success() {
+            Error::Ehbp("2xx response without Ehbp-Response-Nonce".into())
+        } else {
+            Error::UnauthenticatedUpstream {
+                status: status.as_u16(),
+                body: cap_body(body),
+            }
+        });
+    };
+
+    let nonce = hex::decode(&nonce_hex)
+        .map_err(|e| Error::Ehbp(format!("response nonce is not hex: {e}")))?;
+    let opener: FrameOpener = sealed.session.opener(&nonce)?;
+    Ok((FrameDecoder::new(opener), response))
+}
+
+/// Decrypt a sealed response in full.
+///
+/// A sealed body authenticates whatever its status line says, so a non-2xx
+/// *is* enclave output — but it must never come back as `Ok`, or a caller
+/// doing `resp["choices"][0]` on a rate-limit error would silently read
+/// `Value::Null` instead of noticing the failure.
+pub(crate) async fn open_body(
+    mut decoder: FrameDecoder,
+    response: reqwest::Response,
+) -> Result<Vec<u8>> {
+    let status = response.status();
+    let mut out = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        out.extend(decoder.push(&chunk?)?);
+    }
+    decoder.finish()?;
+    if !status.is_success() {
+        return Err(Error::Enclave {
+            status: status.as_u16(),
+            body: cap_body(String::from_utf8_lossy(&out).into_owned()),
+        });
+    }
+    Ok(out)
+}
+
+/// Decrypt a sealed response incrementally.
+///
+/// A sealed non-2xx never produces a stream: the status is checked before any
+/// stream is built and the decrypted body is returned as `Err(Error::Enclave)`
+/// instead. Yielding that body as a stream item would hand a consumer
+/// expecting SSE a single chunk of error JSON with no signal that it isn't a
+/// completion.
+///
+/// On the 2xx path the stream ends after its first error: the decoder is
+/// poisoned by any failure, so continuing past one could only produce more
+/// errors. A transport EOF that leaves a partial frame is itself an error —
+/// the final item — so a truncated stream can never be mistaken for a complete
+/// one.
+pub(crate) async fn open_stream(
+    mut decoder: FrameDecoder,
+    response: reqwest::Response,
+) -> Result<impl Stream<Item = Result<Bytes>>> {
+    let status = response.status();
+    let mut inner = response.bytes_stream();
+
+    if !status.is_success() {
+        let mut out = Vec::new();
+        while let Some(chunk) = inner.next().await {
+            out.extend(decoder.push(&chunk?)?);
+        }
+        decoder.finish()?;
+        return Err(Error::Enclave {
+            status: status.as_u16(),
+            body: cap_body(String::from_utf8_lossy(&out).into_owned()),
+        });
+    }
+
+    let stream = futures::stream::unfold(Some((decoder, inner)), |state| async move {
+        let (mut decoder, mut inner) = state?;
+        match inner.next().await {
+            Some(Ok(chunk)) => match decoder.push(&chunk) {
+                Ok(plain) => Some((Ok(Bytes::from(plain)), Some((decoder, inner)))),
+                Err(e) => Some((Err(e), None)),
+            },
+            Some(Err(e)) => Some((Err(Error::Http(e)), None)),
+            // Transport EOF: only a clean frame boundary ends the stream
+            // successfully.
+            None => match decoder.finish() {
+                Ok(()) => None,
+                Err(e) => Some((Err(e), None)),
+            },
+        }
+    });
+
+    // A transport chunk that completes no frame yields no plaintext; don't
+    // surface those as empty items.
+    Ok(stream.try_filter(|plain| futures::future::ready(!plain.is_empty())))
 }
 
 impl PpqClientBuilder {
@@ -364,211 +455,8 @@ impl PpqClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ehbp::open::{FrameSealer, RESPONSE_EXPORT_LABEL};
-    use hpke::{
-        aead::AesGcm256, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, Kem as _, OpModeR,
-        Serializable,
-    };
-    use std::collections::HashMap;
+    use crate::testutil::*;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    type ServerKey = <X25519HkdfSha256 as hpke::Kem>::PrivateKey;
-
-    /// The response nonce our fake enclave always uses.
-    const NONCE: [u8; 32] = [0x11; 32];
-
-    /// A request as it arrived on the wire.
-    struct Recorded {
-        headers: HashMap<String, String>,
-        body: Vec<u8>,
-    }
-
-    impl Recorded {
-        fn header(&self, name: &str) -> &str {
-            self.headers
-                .get(name)
-                .map(String::as_str)
-                .unwrap_or_else(|| panic!("missing header {name}: {:?}", self.headers))
-        }
-    }
-
-    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|w| w == needle)
-    }
-
-    async fn fill_at_least(sock: &mut TcpStream, buf: &mut Vec<u8>, want: usize) {
-        while buf.len() < want {
-            let mut tmp = [0u8; 4096];
-            let n = sock.read(&mut tmp).await.unwrap();
-            assert!(n > 0, "unexpected EOF while reading the request");
-            buf.extend_from_slice(&tmp[..n]);
-        }
-    }
-
-    async fn read_chunked(sock: &mut TcpStream, rest: &mut Vec<u8>) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let line_end = loop {
-                if let Some(p) = find(rest, b"\r\n") {
-                    break p;
-                }
-                let want = rest.len() + 1;
-                fill_at_least(sock, rest, want).await;
-            };
-            let size = usize::from_str_radix(std::str::from_utf8(&rest[..line_end]).unwrap(), 16)
-                .expect("chunk size is hex");
-            fill_at_least(sock, rest, line_end + 2 + size + 2).await;
-            out.extend_from_slice(&rest[line_end + 2..line_end + 2 + size]);
-            rest.drain(..line_end + 2 + size + 2);
-            if size == 0 {
-                return out;
-            }
-        }
-    }
-
-    async fn read_request(sock: &mut TcpStream) -> Recorded {
-        let mut buf = Vec::new();
-        let head_end = loop {
-            if let Some(p) = find(&buf, b"\r\n\r\n") {
-                break p + 4;
-            }
-            let want = buf.len() + 1;
-            fill_at_least(sock, &mut buf, want).await;
-        };
-        let head = String::from_utf8(buf[..head_end].to_vec()).unwrap();
-        let mut headers = HashMap::new();
-        for line in head.lines().skip(1) {
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-            }
-        }
-        let mut rest = buf[head_end..].to_vec();
-
-        let chunked = headers
-            .get("transfer-encoding")
-            .is_some_and(|v| v.contains("chunked"));
-        let body = if chunked {
-            read_chunked(sock, &mut rest).await
-        } else {
-            let len: usize = headers
-                .get("content-length")
-                .map(|v| v.parse().unwrap())
-                .unwrap_or(0);
-            fill_at_least(sock, &mut rest, len).await;
-            rest.truncate(len);
-            rest
-        };
-        Recorded { headers, body }
-    }
-
-    /// Serve exactly one request from `127.0.0.1`, then close the connection.
-    ///
-    /// `handler` returns the raw response bytes, so a test can send a
-    /// deliberately malformed or truncated one. The recorded request is handed
-    /// back through the returned handle for the test to assert on.
-    async fn serve<F>(handler: F) -> (String, Arc<Mutex<Option<Recorded>>>)
-    where
-        F: FnOnce(&Recorded) -> Vec<u8> + Send + 'static,
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let recorded = Arc::new(Mutex::new(None));
-        let sink = Arc::clone(&recorded);
-
-        tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut sock).await;
-            let response = handler(&request);
-            *sink.lock().unwrap() = Some(request);
-            sock.write_all(&response).await.unwrap();
-            // Body framed by close, so a truncated body stays truncated.
-            sock.shutdown().await.unwrap();
-        });
-
-        (base, recorded)
-    }
-
-    /// A response whose body is delimited by connection close.
-    fn http_response(status: u16, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
-        let mut out = format!("HTTP/1.1 {status} X\r\nConnection: close\r\n").into_bytes();
-        for (k, v) in headers {
-            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(body);
-        out
-    }
-
-    fn keypair() -> (ServerKey, [u8; 32]) {
-        let (sk, pk) = X25519HkdfSha256::gen_keypair();
-        let pk_bytes: [u8; 32] = pk.to_bytes().as_slice().try_into().unwrap();
-        (sk, pk_bytes)
-    }
-
-    /// The enclave half: open the sealed request, then seal `parts` back.
-    ///
-    /// Built on `hpke::setup_receiver` rather than on any client code, so a
-    /// passing round trip means the client's derivation agrees with an
-    /// independent implementation of RFC 9180.
-    fn enclave(
-        sk: &ServerKey,
-        request: &Recorded,
-        parts: &[&[u8]],
-    ) -> (serde_json::Value, Vec<u8>) {
-        let enc_bytes: [u8; 32] = hex::decode(request.header("ehbp-encapsulated-key"))
-            .expect("encapsulated key is hex")
-            .try_into()
-            .expect("encapsulated key is 32 bytes");
-        let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(&enc_bytes).unwrap();
-        let mut ctx = hpke::setup_receiver::<AesGcm256, HkdfSha256, X25519HkdfSha256>(
-            &OpModeR::Base,
-            sk,
-            &enc,
-            seal::REQUEST_INFO,
-        )
-        .unwrap();
-
-        let mut plaintext = Vec::new();
-        let mut rest = &request.body[..];
-        while rest.len() >= 4 {
-            let n = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
-            rest = &rest[4..];
-            plaintext.extend(ctx.open(&rest[..n], b"").expect("request authenticates"));
-            rest = &rest[n..];
-        }
-
-        let mut secret = [0u8; 32];
-        ctx.export(RESPONSE_EXPORT_LABEL, &mut secret).unwrap();
-        let mut sealer = FrameSealer::new(&secret, &enc_bytes, &NONCE).unwrap();
-        let mut body = Vec::new();
-        for p in parts {
-            body.extend(sealer.seal_frame(p).unwrap());
-        }
-        (
-            serde_json::from_slice(&plaintext).expect("request body is JSON"),
-            body,
-        )
-    }
-
-    fn client_for(base: &str, hpke_public_key: [u8; 32]) -> PpqClient {
-        PpqClient {
-            http: reqwest::Client::new(),
-            base_url: base.to_string(),
-            api_key: "sk-test".to_string(),
-            attestation: Attestation {
-                hpke_public_key,
-                tls_key_fingerprint: [0u8; 32],
-                measurement: [0u8; 48],
-                domain: "test.invalid".to_string(),
-            },
-        }
-    }
-
-    fn nonce_header() -> (&'static str, String) {
-        ("Ehbp-Response-Nonce", hex::encode(NONCE))
-    }
 
     #[tokio::test]
     async fn round_trips_a_completion_through_the_sealed_channel() {
@@ -810,6 +698,31 @@ mod tests {
             .chat_completion(serde_json::json!("not an object"))
             .await
             .is_err());
+    }
+
+    /// `seal_and_send` takes a URL because the `rig` transport gets one from
+    /// rig's own routing rather than building it here. A URL off the attested
+    /// origin would carry the bearer token — and a body sealed to the enclave
+    /// key — somewhere the hardware never vouched for, so it is refused. The
+    /// look-alike host is the case a bare `starts_with` would let through.
+    #[tokio::test]
+    async fn refuses_to_seal_a_request_outside_the_attested_origin() {
+        let (_, pk) = keypair();
+        let client = client_for("https://api.ppq.ai", pk);
+
+        for url in [
+            "https://api.ppq.ai.attacker.example/private/v1/chat/completions",
+            "https://attacker.example/private/v1/chat/completions",
+        ] {
+            let err = seal_and_send(&client, url, b"{}", Default::default())
+                .await
+                .map(|_| ())
+                .expect_err("only the attested origin may receive a sealed request");
+            assert!(
+                err.to_string().contains("outside the attested origin"),
+                "got: {err}"
+            );
+        }
     }
 
     #[test]

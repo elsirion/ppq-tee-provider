@@ -7,7 +7,10 @@ description = "Attested, end-to-end encrypted in-process client for PPQ.AI TEE m
 
 [features]
 default = []
-rig = ["dep:rig-core"]
+# `http` is not optional in spirit — it is already in the tree via `reqwest` —
+# but it is only *named* by the rig transport, whose signatures are written in
+# `http::Request`/`http::Response`.
+rig = ["dep:rig-core", "dep:http"]
 # Exposes `ehbp::open::FrameSealer`, the EHBP *server* half of the response
 # AEAD. Off by default: a client build has no business sealing responses. It
 # lives beside the opener so the two derivations cannot drift apart, and is
@@ -52,6 +55,11 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 hkdf = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 rig-core = { version = "0.41", optional = true }
+http = { version = "1", optional = true }
+
+[[example]]
+name = "rig_agent"
+required-features = ["rig"]
 
 [dev-dependencies]
 # `net`/`io-util` are for the in-process EHBP server the client tests run

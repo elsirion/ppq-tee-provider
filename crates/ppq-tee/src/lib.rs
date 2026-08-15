@@ -4,6 +4,13 @@ pub mod attest;
 pub mod client;
 pub mod ehbp;
 pub mod models;
+#[cfg(feature = "rig")]
+pub mod rig;
+
+/// The in-process EHBP enclave the client and `rig` test suites both run
+/// against. Test-only; never compiled into a released build.
+#[cfg(test)]
+mod testutil;
 
 pub use client::{PpqClient, PpqClientBuilder};
 pub use models::{enclave_model_id, Pricing, PrivateModel};
@@ -28,6 +35,11 @@ pub enum Error {
     /// decrypted and trustworthy — unlike `UnauthenticatedUpstream`.
     #[error("enclave returned HTTP {status}: {body}")]
     Enclave { status: u16, body: String },
+    /// A model id that cannot be carried in the `X-Private-Model` header, e.g.
+    /// one containing a newline. Rejected rather than panicked on, so a model
+    /// id taken from configuration or a catalogue can never abort the process.
+    #[error("model id is not a valid header value: {0:?}")]
+    InvalidModelId(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

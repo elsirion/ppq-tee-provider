@@ -1676,6 +1676,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hpke",
+ "http",
  "p384",
  "reqwest 0.12.28",
  "rig-core",
