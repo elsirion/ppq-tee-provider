@@ -30,6 +30,13 @@ sigstore-verify = { version = "0.11", default-features = false, features = ["rus
 sigstore-trust-root = { version = "0.11", default-features = false, features = ["rustls"] }
 sigstore-types = { version = "0.11", default-features = false }
 x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
+# AMD attestation: the VCEK signs reports with ECDSA-P384, and every
+# certificate in AMD's ARK -> ASK -> VCEK chain is signed with RSASSA-PSS
+# (SHA-384, MGF1-SHA-384, 48-byte salt). Both crates are pure Rust.
+p384 = { version = "0.13", features = ["ecdsa"] }
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+const-oid = { version = "0.9", default-features = false }
 rig-core = { version = "0.41", optional = true }
 
 [dev-dependencies]
