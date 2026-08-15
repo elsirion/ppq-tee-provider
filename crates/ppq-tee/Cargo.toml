@@ -17,6 +17,7 @@ hex = "0.4"
 base64 = "0.22"
 bytes = "1"
 futures = "0.3"
+flate2 = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rig-core = { version = "0.41", optional = true }
