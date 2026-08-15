@@ -121,6 +121,14 @@ impl FrameOpener {
             .map_err(|_| Error::Ehbp("response frame failed authentication".into()))?;
         // Advance only after a frame authenticates, so a rejected frame cannot
         // desynchronise the sequence.
+        //
+        // This is deliberately the *opposite* of `FrameSealer::seal_frame`, and
+        // the asymmetry is not an oversight — do not "fix" one to match the
+        // other. Reusing a sequence number to *open* is harmless: it decrypts
+        // nothing that did not already authenticate under that nonce, and the
+        // alternative would let a single injected junk frame desynchronise the
+        // whole stream. Reusing one to *seal* repeats a GCM nonce under a live
+        // key, which leaks the authentication key outright.
         self.seq = self
             .seq
             .checked_add(1)
@@ -140,7 +148,12 @@ impl FrameOpener {
 pub struct FrameSealer {
     cipher: Aes256Gcm,
     base: [u8; 12],
-    seq: u64,
+    /// The next sequence number, or `None` once the sealer is poisoned.
+    ///
+    /// See [`FrameSealer::seal_frame`]: a sealer that failed part-way, or that
+    /// ran out of sequence numbers, must never hand out a nonce it has already
+    /// used, so it stops working instead.
+    seq: Option<u64>,
 }
 
 #[cfg(any(test, feature = "test-server"))]
@@ -150,13 +163,30 @@ impl FrameSealer {
         Ok(Self {
             cipher,
             base,
-            seq: 0,
+            seq: Some(0),
         })
     }
 
     /// Seal one frame, returning it length-prefixed and ready to write.
+    ///
+    /// The sequence number is consumed *before* the frame is encrypted: the
+    /// sealer poisons itself on the way in and only un-poisons, at `seq + 1`,
+    /// on the way out. A caller that retries after any failure therefore gets
+    /// an error rather than a second frame under a nonce that has already been
+    /// used — repeating a GCM nonce under a live key leaks the authentication
+    /// key, so failing shut is the only safe direction here.
+    ///
+    /// Note that this is the reverse of [`FrameOpener::open_frame`], which
+    /// advances only *after* a frame authenticates. That asymmetry is
+    /// deliberate; the reasoning is on `open_frame`.
     pub fn seal_frame(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let nonce = frame_nonce(&self.base, self.seq);
+        let seq = self.seq.ok_or_else(|| {
+            Error::Ehbp("response frame sealer is poisoned; its nonces cannot be reused".into())
+        })?;
+        // Burn it first. Every `?` below leaves the sealer poisoned.
+        self.seq = None;
+
+        let nonce = frame_nonce(&self.base, seq);
         let ct = self
             .cipher
             .encrypt(&Nonce::<Aes256Gcm>::from(nonce), plaintext)
@@ -164,10 +194,10 @@ impl FrameSealer {
         if ct.len() > u32::MAX as usize {
             return Err(Error::Ehbp("response frame is too large to frame".into()));
         }
-        self.seq = self
-            .seq
-            .checked_add(1)
-            .ok_or_else(|| Error::Ehbp("response frame sequence exhausted".into()))?;
+
+        // `checked_add` leaves `None` at the end of the sequence space, so an
+        // exhausted sealer stays poisoned rather than wrapping to nonce 0.
+        self.seq = seq.checked_add(1);
         Ok(crate::ehbp::seal::frame(&ct))
     }
 }
@@ -336,6 +366,54 @@ mod tests {
         let a = s.seal_frame(b"same").unwrap();
         let b = s.seal_frame(b"same").unwrap();
         assert_ne!(a, b, "frame nonces must not repeat");
+    }
+
+    /// A sealer that failed part-way through `seal_frame` has already chosen a
+    /// nonce. If a retry could pick that same nonce, two different ciphertexts
+    /// would exist under one GCM nonce and the authentication key falls out.
+    /// The failure paths inside the encrypt step are not reachable from a test
+    /// (AES-GCM only refuses inputs larger than this process can allocate), so
+    /// assert on the state those paths leave behind: a poisoned sealer refuses
+    /// to seal at all.
+    #[test]
+    fn a_poisoned_sealer_refuses_to_seal_rather_than_reusing_a_nonce() {
+        let mut s = FrameSealer::new(&[1u8; 32], &[2u8; 32], &[3u8; 32]).unwrap();
+        // Exactly what any `?` inside `seal_frame` leaves behind.
+        s.seq = None;
+        let err = s
+            .seal_frame(b"anything")
+            .expect_err("a poisoned sealer must not seal");
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+        // And it stays poisoned; there is no recovery that reuses a nonce.
+        assert!(s.seal_frame(b"anything").is_err());
+    }
+
+    #[test]
+    fn a_sealer_poisons_itself_at_the_end_of_the_sequence_space() {
+        let mut s = FrameSealer::new(&[1u8; 32], &[2u8; 32], &[3u8; 32]).unwrap();
+        s.seq = Some(u64::MAX);
+        // The last sequence number is still usable...
+        assert!(!s.seal_frame(b"final").expect("last frame seals").is_empty());
+        // ...but the counter wraps to 0 in `u64` arithmetic, which would repeat
+        // the very first nonce. It must poison instead.
+        assert!(s.seq.is_none(), "exhausted sealer must not hold a sequence");
+        assert!(s.seal_frame(b"one too many").is_err());
+    }
+
+    #[test]
+    fn a_sealer_consumes_its_sequence_number_before_encrypting() {
+        let mut s = FrameSealer::new(&[1u8; 32], &[2u8; 32], &[3u8; 32]).unwrap();
+        assert_eq!(s.seq, Some(0));
+        let first = s.seal_frame(b"one").unwrap();
+        // The counter is now *past* the nonce that frame used, never equal to
+        // it, so nothing the sealer does later can reproduce it.
+        assert_eq!(s.seq, Some(1));
+        let mut fresh = FrameSealer::new(&[1u8; 32], &[2u8; 32], &[3u8; 32]).unwrap();
+        assert_eq!(
+            fresh.seal_frame(b"one").unwrap(),
+            first,
+            "the first frame is the one sealed under sequence 0"
+        );
     }
 
     #[test]

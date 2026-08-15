@@ -418,7 +418,9 @@ impl PpqClientBuilder {
             .read_timeout(READ_TIMEOUT)
             .build()?;
 
-        let attestation = attest::attest(&base_url, &policy).await?;
+        // Attestation goes through the same client, so a stalled attestation
+        // endpoint cannot hang `build()` — the one call every user makes.
+        let attestation = attest::attest(&http, &base_url, &policy).await?;
 
         // Cross-check the advertised key config against the attested key. A
         // mismatch means the endpoint is serving a key the hardware never

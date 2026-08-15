@@ -245,7 +245,18 @@ fn rekor_integrated_time(bundle: &AttestationBundle) -> Result<SystemTime> {
             "rekor integratedTime {raw:?} is not a valid unix timestamp: {e}"
         ))
     })?;
-    Ok(UNIX_EPOCH + Duration::from_secs(secs))
+    // `checked_add`, not `+`: `SystemTime` addition panics on overflow, and
+    // `secs` is attacker-controlled. Nothing upstream of here narrows it — the
+    // parse above accepts the full `u64` range on purpose, so that this
+    // function does not depend on `sigstore-types` happening to parse the same
+    // field as an `i64` first.
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| {
+            Error::Attestation(format!(
+                "rekor integratedTime {raw:?} is too far in the future to represent"
+            ))
+        })
 }
 
 /// Reject attestations whose Rekor entry falls outside `max_age` of now.
@@ -431,6 +442,40 @@ mod tests {
         assert!(
             err.to_string().contains("old, want at most"),
             "must fail on the age check, not incidentally: {err}"
+        );
+    }
+
+    /// `SystemTime + Duration` panics on overflow and `integratedTime` comes
+    /// straight off the wire, so the guard must turn it into an error.
+    ///
+    /// Exercised against `rekor_integrated_time` directly rather than through
+    /// `verify`: `parse_bundle` happens to reject a `u64::MAX` timestamp first,
+    /// because `sigstore-types` parses the same field as an `i64`. That is an
+    /// incidental invariant of another crate's serde derive, exactly what this
+    /// guard exists not to depend on.
+    #[test]
+    fn rejects_an_integrated_time_too_large_to_represent() {
+        let mut b = fixture();
+        b.sigstore_bundle["verificationMaterial"]["tlogEntries"][0]["integratedTime"] =
+            serde_json::json!(u64::MAX.to_string());
+        let err = rekor_integrated_time(&b).expect_err("must not produce a SystemTime");
+        assert!(
+            err.to_string()
+                .contains("too far in the future to represent"),
+            "must fail on the overflow guard, not incidentally: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_an_ordinary_integrated_time() {
+        // The same path on a value that does fit, so the guard above is known
+        // to be rejecting overflow rather than everything.
+        let mut b = fixture();
+        b.sigstore_bundle["verificationMaterial"]["tlogEntries"][0]["integratedTime"] =
+            serde_json::json!("1786661855");
+        assert_eq!(
+            rekor_integrated_time(&b).expect("a representable timestamp"),
+            UNIX_EPOCH + Duration::from_secs(1_786_661_855),
         );
     }
 

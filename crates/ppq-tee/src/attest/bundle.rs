@@ -64,13 +64,52 @@ pub fn decode_report_body(body: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub async fn fetch(base: &str) -> Result<AttestationBundle> {
-    let body = reqwest::get(format!("{base}/private/attestation"))
+/// Cap on the attestation bundle body.
+///
+/// This response is unauthenticated and read *before* any verification has run,
+/// so it is the one place an attacker can make this process allocate before
+/// being told no. The live bundle is ~18 KB; 1 MiB is far above anything
+/// Tinfoil could plausibly serve while still being a bound.
+const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
+
+/// Fetch the attestation bundle for `base` over `http`.
+///
+/// `http` is the caller's configured client rather than a fresh default one,
+/// so that its connect and read timeouts apply here too — otherwise a stalled
+/// attestation endpoint would hang client construction indefinitely.
+pub async fn fetch(http: &reqwest::Client, base: &str) -> Result<AttestationBundle> {
+    let mut resp = http
+        .get(format!("{base}/private/attestation"))
+        .send()
         .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    parse(&body)
+        .error_for_status()?;
+
+    // Reject on the advertised length when there is one, so an oversized body
+    // is refused before a byte of it is read — then enforce the same cap while
+    // streaming, because `Content-Length` is attacker-supplied, may be absent
+    // under chunked encoding, and may simply be a lie.
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_BUNDLE_BYTES as u64)
+    {
+        return Err(Error::Attestation(format!(
+            "attestation bundle advertises more than {MAX_BUNDLE_BYTES} bytes"
+        )));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > MAX_BUNDLE_BYTES {
+            return Err(Error::Attestation(format!(
+                "attestation bundle is larger than {MAX_BUNDLE_BYTES} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let text = std::str::from_utf8(&body)
+        .map_err(|e| Error::Attestation(format!("attestation bundle is not UTF-8: {e}")))?;
+    parse(text)
 }
 
 #[cfg(test)]
@@ -109,6 +148,48 @@ mod tests {
         // Valid base64, but the decoded bytes are not a gzip stream at all.
         let body = STANDARD.encode(b"this is definitely not a gzip stream");
         assert!(decode_report_body(&body).is_err());
+    }
+
+    /// The bundle body is read before anything about it has been verified, so
+    /// an unauthenticated endpoint must not be able to stream an unbounded
+    /// amount into memory. Served with no `Content-Length` so the streaming cap
+    /// — not the advertised-length shortcut — is what stops it.
+    #[tokio::test]
+    async fn rejects_an_oversized_bundle_body() {
+        let (base, _rec) = crate::testutil::serve(|_| {
+            crate::testutil::http_response(200, &[], &vec![b'x'; MAX_BUNDLE_BYTES + 1])
+        })
+        .await;
+
+        let err = fetch(&reqwest::Client::new(), &base)
+            .await
+            .expect_err("an oversized bundle must not be read");
+        assert!(
+            err.to_string().contains("larger than"),
+            "must fail on the size cap, not incidentally: {err}"
+        );
+    }
+
+    /// The same path on a body that fits, so the cap above is known to be
+    /// rejecting size rather than everything.
+    #[tokio::test]
+    async fn fetches_a_bundle_within_the_cap() {
+        let (base, rec) = crate::testutil::serve(|_| {
+            crate::testutil::http_response(200, &[], FIXTURE.as_bytes())
+        })
+        .await;
+
+        let b = fetch(&reqwest::Client::new(), &base)
+            .await
+            .expect("a normal bundle fetches");
+        assert_eq!(b.domain, "inference.tinfoil.sh");
+        assert!(rec
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .request_line
+            .contains("/private/attestation"));
     }
 
     #[test]

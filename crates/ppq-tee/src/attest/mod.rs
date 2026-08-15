@@ -93,8 +93,16 @@ pub fn verify_bundle(bundle: &AttestationBundle, policy: &TrustPolicy) -> Result
 }
 
 /// Fetch and verify the live attestation for `base`.
-pub async fn attest(base: &str, policy: &TrustPolicy) -> Result<Attestation> {
-    let b = bundle::fetch(base).await?;
+///
+/// Takes the caller's `http` client so the fetch inherits its timeouts; a
+/// default client has none, and this call sits on the critical path of every
+/// `PpqClient::build()`.
+pub async fn attest(
+    http: &reqwest::Client,
+    base: &str,
+    policy: &TrustPolicy,
+) -> Result<Attestation> {
+    let b = bundle::fetch(http, base).await?;
     verify_bundle(&b, policy)
 }
 
