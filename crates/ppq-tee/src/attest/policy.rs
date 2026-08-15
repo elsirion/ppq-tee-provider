@@ -13,7 +13,22 @@ pub struct TrustPolicy {
     pub signer_repository: String,
     pub oidc_issuer: String,
     pub require_debug_disabled: bool,
+    /// Reject attestations whose Rekor entry is older than this.
+    ///
+    /// Both the deployment digest and the sigstore bundle in an attestation
+    /// response come from the server being attested, so without this bound a
+    /// malicious server could replay any attestation
+    /// `tinfoilsh/confidential-model-router` has ever signed — including an
+    /// older release with a known-bad measurement. The hardware layer cannot
+    /// detect this; only freshness of the signed statement can.
+    ///
+    /// `None` disables the check.
+    pub max_attestation_age: Option<std::time::Duration>,
 }
+
+/// Default bound for [`TrustPolicy::max_attestation_age`]: 90 days.
+const DEFAULT_MAX_ATTESTATION_AGE: std::time::Duration =
+    std::time::Duration::from_secs(90 * 24 * 60 * 60);
 
 impl Default for TrustPolicy {
     fn default() -> Self {
@@ -21,6 +36,7 @@ impl Default for TrustPolicy {
             signer_repository: "tinfoilsh/confidential-model-router".to_string(),
             oidc_issuer: "https://token.actions.githubusercontent.com".to_string(),
             require_debug_disabled: true,
+            max_attestation_age: Some(DEFAULT_MAX_ATTESTATION_AGE),
         }
     }
 }
@@ -59,6 +75,10 @@ mod tests {
         assert_eq!(p.signer_repository, "tinfoilsh/confidential-model-router");
         assert_eq!(p.oidc_issuer, "https://token.actions.githubusercontent.com");
         assert!(p.require_debug_disabled);
+        assert_eq!(
+            p.max_attestation_age,
+            Some(std::time::Duration::from_secs(90 * 24 * 60 * 60))
+        );
     }
 
     #[test]
