@@ -54,4 +54,6 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 rig-core = { version = "0.41", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `net`/`io-util` are for the in-process EHBP server the client tests run
+# against; they are test-only and never reach a default build.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }

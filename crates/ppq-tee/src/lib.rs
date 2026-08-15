@@ -1,7 +1,12 @@
 //! Attested, end-to-end encrypted in-process client for PPQ.AI TEE models.
 
 pub mod attest;
+pub mod client;
 pub mod ehbp;
+pub mod models;
+
+pub use client::{PpqClient, PpqClientBuilder};
+pub use models::{enclave_model_id, Pricing, PrivateModel};
 
 /// Every failure mode in this crate. There are no warn-and-continue paths.
 #[derive(Debug, thiserror::Error)]
