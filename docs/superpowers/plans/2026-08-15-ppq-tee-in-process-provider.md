@@ -2428,7 +2428,7 @@ async fn rejects_a_tampered_trust_policy() {
 Run: `nix develop -c cargo test -p ppq-tee`
 Expected: all offline tests pass; live tests reported as ignored.
 
-Run: `PPQ_API_KEY=sk-... nix develop -c cargo test -p ppq-tee --test live -- --ignored`
+Run: `PPQ_API_KEY=$PPQ_API_KEY nix develop -c cargo test -p ppq-tee --test live -- --ignored`
 Expected: 5 passed. This is the first end-to-end proof: attestation, sealing,
 decryption and streaming all working against the real enclave.
 
@@ -2670,7 +2670,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Run: `PPQ_API_KEY=sk-... nix develop -c cargo run -p ppq-tee --features rig --example rig_agent`
+Run: `PPQ_API_KEY=$PPQ_API_KEY nix develop -c cargo run -p ppq-tee --features rig --example rig_agent`
 Expected: prints the attested enclave line, then a model answer.
 
 - [ ] **Step 7: Commit**
