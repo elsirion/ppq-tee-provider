@@ -42,9 +42,11 @@ impl Default for TrustPolicy {
 }
 
 /// Sigstore trusted root (Fulcio/Rekor/CT/TSA keys), verified against the
-/// signed TUF targets metadata. See `testdata/amd/PROVENANCE.md` for the AMD
-/// roots' provenance; this file's provenance is recorded in the Task 3
-/// report.
+/// signed TUF targets metadata.
+///
+/// Provenance — how it was obtained, its digest, and how to refresh it — is in
+/// `testdata/sigstore-trusted-root.PROVENANCE.md`; the AMD roots' equivalent is
+/// `testdata/amd/PROVENANCE.md`.
 pub const SIGSTORE_TRUSTED_ROOT: &str = include_str!("../../testdata/sigstore-trusted-root.json");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
