@@ -223,8 +223,14 @@ mod tests {
         // report/vcek are otherwise used, and Turin is passed only to select
         // the code path under test.
         let (r, k, m, _product) = parts();
-        let err = verify_report(&r, &k, &m, &policy_ignoring_fixture_age(), AmdProduct::Turin)
-            .expect_err("must refuse Turin");
+        let err = verify_report(
+            &r,
+            &k,
+            &m,
+            &policy_ignoring_fixture_age(),
+            AmdProduct::Turin,
+        )
+        .expect_err("must refuse Turin");
         assert!(
             err.to_string().contains("family 1Ah"),
             "must name the unsupported family: {err}"

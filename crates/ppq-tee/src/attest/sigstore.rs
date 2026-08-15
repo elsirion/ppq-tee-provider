@@ -239,9 +239,7 @@ fn check_subject0_digest(statement: &serde_json::Value, bundle_digest: &str) -> 
 fn rekor_integrated_time(bundle: &AttestationBundle) -> Result<SystemTime> {
     let raw = bundle.sigstore_bundle["verificationMaterial"]["tlogEntries"][0]["integratedTime"]
         .as_str()
-        .ok_or_else(|| {
-            Error::Attestation("rekor entry has no (string) integratedTime".into())
-        })?;
+        .ok_or_else(|| Error::Attestation("rekor entry has no (string) integratedTime".into()))?;
     let secs: u64 = raw.parse().map_err(|e| {
         Error::Attestation(format!(
             "rekor integratedTime {raw:?} is not a valid unix timestamp: {e}"
@@ -414,7 +412,8 @@ mod tests {
         };
         let err = verify(&fixture(), &policy).expect_err("must not verify");
         assert!(
-            err.to_string().contains("signer_repository must not be empty"),
+            err.to_string()
+                .contains("signer_repository must not be empty"),
             "must fail on the empty-policy guard, not incidentally: {err}"
         );
     }
@@ -463,7 +462,10 @@ mod tests {
 
         // Sanity check the positive path too, so a trivially-always-failing
         // comparison couldn't make the rejection above meaningless.
-        check_subject0_digest(&statement, "1111111111111111111111111111111111111111111111111111111111111111")
-            .expect("must accept a digest that matches subject[0]");
+        check_subject0_digest(
+            &statement,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .expect("must accept a digest that matches subject[0]");
     }
 }

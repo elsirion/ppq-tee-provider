@@ -45,7 +45,13 @@ pub fn parse(raw: &[u8]) -> Result<KeyConfig> {
         )));
     }
 
-    Ok(KeyConfig { key_id, kem_id, public_key, kdf_id, aead_id })
+    Ok(KeyConfig {
+        key_id,
+        kem_id,
+        public_key,
+        kdf_id,
+        aead_id,
+    })
 }
 
 #[cfg(test)]

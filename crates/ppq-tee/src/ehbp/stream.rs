@@ -192,7 +192,10 @@ mod tests {
         let (mut s, mut d) = pair();
         let mut wire = s.seal_frame(b"tampered").unwrap();
         wire[8] ^= 0xFF;
-        assert!(d.push(&wire).is_err(), "must not emit unauthenticated bytes");
+        assert!(
+            d.push(&wire).is_err(),
+            "must not emit unauthenticated bytes"
+        );
     }
 
     #[test]

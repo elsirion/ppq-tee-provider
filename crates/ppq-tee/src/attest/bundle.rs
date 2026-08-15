@@ -118,8 +118,7 @@ mod tests {
         // Gzip-compress a run of zero bytes well over the expected report size, so that
         // decompression would otherwise inflate far past `SNP_REPORT_SIZE`.
         let big = vec![0u8; 10 * (SNP_REPORT_SIZE as usize)];
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(&big).expect("gzip encode succeeds");
         let gz = encoder.finish().expect("gzip finish succeeds");
 
