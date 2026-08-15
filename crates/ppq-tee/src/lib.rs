@@ -24,6 +24,10 @@ pub enum Error {
     /// and must never be treated as enclave output.
     #[error("unauthenticated upstream error (HTTP {status}): {body}")]
     UnauthenticatedUpstream { status: u16, body: String },
+    /// The enclave returned an authenticated error response. The body is
+    /// decrypted and trustworthy — unlike `UnauthenticatedUpstream`.
+    #[error("enclave returned HTTP {status}: {body}")]
+    Enclave { status: u16, body: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

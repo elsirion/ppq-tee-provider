@@ -10,7 +10,36 @@ use futures::{Stream, StreamExt, TryStreamExt};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.ppq.ai";
 
-#[derive(Debug, Clone)]
+/// How long to wait for the TCP+TLS handshake before giving up.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a single read on the socket may stall before giving up.
+///
+/// This resets after every successful read, so it bounds *stalls*, not total
+/// duration — a long but steadily-trickling SSE stream never trips it.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cap on an error body pulled from an untrusted or semi-trusted response, so
+/// a hostile or misbehaving peer cannot inflate a single error message
+/// without bound.
+const MAX_ERROR_BODY_BYTES: usize = 4096;
+
+/// Truncate `body` to `MAX_ERROR_BODY_BYTES`, noting it in the string when it
+/// happens, so nothing downstream mistakes the cut text for the whole body.
+fn cap_body(mut body: String) -> String {
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body;
+    }
+    let mut cut = MAX_ERROR_BODY_BYTES;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    body.truncate(cut);
+    body.push_str(&format!("... (truncated to {MAX_ERROR_BODY_BYTES} bytes)"));
+    body
+}
+
+#[derive(Clone)]
 pub struct PpqClient {
     pub(crate) http: reqwest::Client,
     pub(crate) base_url: String,
@@ -18,11 +47,37 @@ pub struct PpqClient {
     pub(crate) attestation: Attestation,
 }
 
-#[derive(Debug, Default)]
+/// Hand-written to redact `api_key` — `PpqClient` is public and a leaked
+/// bearer token in a `dbg!` or `tracing::debug!(?client)` is a real
+/// vulnerability, not a hypothetical one.
+impl std::fmt::Debug for PpqClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PpqClient")
+            .field("http", &self.http)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("attestation", &self.attestation)
+            .finish()
+    }
+}
+
+#[derive(Default)]
 pub struct PpqClientBuilder {
     api_key: Option<String>,
     base_url: Option<String>,
     trust_policy: Option<TrustPolicy>,
+}
+
+/// Hand-written for the same reason as `PpqClient`'s: `api_key` must never
+/// appear in a formatted output, even before the client is built.
+impl std::fmt::Debug for PpqClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PpqClientBuilder")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("trust_policy", &self.trust_policy)
+            .finish()
+    }
 }
 
 impl PpqClient {
@@ -67,55 +122,85 @@ impl PpqClient {
     /// Send one OpenAI-format chat completion through the sealed channel.
     ///
     /// The returned value is the enclave's decrypted body. A sealed non-2xx
-    /// (e.g. a rate-limit error the enclave itself produced) is returned the
-    /// same way: it authenticated, so it *is* enclave output. Only responses
-    /// that never carried an `Ehbp-Response-Nonce` are errors here.
+    /// (e.g. a rate-limit error the enclave itself produced) still
+    /// authenticates — it *is* enclave output — but is surfaced as
+    /// `Err(Error::Enclave)` rather than `Ok`, so a caller cannot mistake a
+    /// rate-limit or payment error for a completion. Only responses that
+    /// never carried an `Ehbp-Response-Nonce` become `Error::UnauthenticatedUpstream`.
     pub async fn chat_completion(&self, mut body: serde_json::Value) -> Result<serde_json::Value> {
         let model = self.take_model(&mut body)?;
         let (mut decoder, response) = self.send_sealed(&body, &model).await?;
+        let status = response.status();
         let mut out = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             out.extend(decoder.push(&chunk?)?);
         }
         decoder.finish()?;
+        if !status.is_success() {
+            return Err(Error::Enclave {
+                status: status.as_u16(),
+                body: cap_body(String::from_utf8_lossy(&out).into_owned()),
+            });
+        }
         Ok(serde_json::from_slice(&out)?)
     }
 
     /// Stream one OpenAI-format chat completion; yields decrypted SSE bytes.
     ///
-    /// The stream ends after its first error: the decoder is poisoned by any
-    /// failure, so continuing past one could only produce more errors. A
-    /// transport EOF that leaves a partial frame is itself an error — the
-    /// final item — so a truncated stream can never be mistaken for a
-    /// complete one.
+    /// A sealed non-2xx never produces a stream: the status is checked
+    /// against the response headers before any stream is built, and a
+    /// failure is returned as `Err(Error::Enclave)` from this function
+    /// instead. The alternative — yielding the decrypted error body as a
+    /// stream item — would hand a consumer expecting SSE a single chunk of
+    /// error JSON with no signal that it isn't a completion; checking the
+    /// status upfront lets the error surface through the same `?` a caller
+    /// already uses for every other failure mode here, rather than requiring
+    /// stream consumers to separately inspect each item for an error shape.
+    ///
+    /// On the 2xx path, the stream ends after its first error: the decoder is
+    /// poisoned by any failure, so continuing past one could only produce
+    /// more errors. A transport EOF that leaves a partial frame is itself an
+    /// error — the final item — so a truncated stream can never be mistaken
+    /// for a complete one.
     pub async fn chat_completion_stream(
         &self,
         mut body: serde_json::Value,
     ) -> Result<impl Stream<Item = Result<Bytes>>> {
         let model = self.take_model(&mut body)?;
         body["stream"] = serde_json::Value::Bool(true);
-        let (decoder, response) = self.send_sealed(&body, &model).await?;
+        let (mut decoder, response) = self.send_sealed(&body, &model).await?;
+        let status = response.status();
+        let mut inner = response.bytes_stream();
 
-        let stream = futures::stream::unfold(
-            Some((decoder, response.bytes_stream())),
-            |state| async move {
-                let (mut decoder, mut inner) = state?;
-                match inner.next().await {
-                    Some(Ok(chunk)) => match decoder.push(&chunk) {
-                        Ok(plain) => Some((Ok(Bytes::from(plain)), Some((decoder, inner)))),
-                        Err(e) => Some((Err(e), None)),
-                    },
-                    Some(Err(e)) => Some((Err(Error::Http(e)), None)),
-                    // Transport EOF: only a clean frame boundary ends the
-                    // stream successfully.
-                    None => match decoder.finish() {
-                        Ok(()) => None,
-                        Err(e) => Some((Err(e), None)),
-                    },
-                }
-            },
-        );
+        if !status.is_success() {
+            let mut out = Vec::new();
+            while let Some(chunk) = inner.next().await {
+                out.extend(decoder.push(&chunk?)?);
+            }
+            decoder.finish()?;
+            return Err(Error::Enclave {
+                status: status.as_u16(),
+                body: cap_body(String::from_utf8_lossy(&out).into_owned()),
+            });
+        }
+
+        let stream = futures::stream::unfold(Some((decoder, inner)), |state| async move {
+            let (mut decoder, mut inner) = state?;
+            match inner.next().await {
+                Some(Ok(chunk)) => match decoder.push(&chunk) {
+                    Ok(plain) => Some((Ok(Bytes::from(plain)), Some((decoder, inner)))),
+                    Err(e) => Some((Err(e), None)),
+                },
+                Some(Err(e)) => Some((Err(Error::Http(e)), None)),
+                // Transport EOF: only a clean frame boundary ends the
+                // stream successfully.
+                None => match decoder.finish() {
+                    Ok(()) => None,
+                    Err(e) => Some((Err(e), None)),
+                },
+            }
+        });
 
         // A transport chunk that completes no frame yields no plaintext;
         // don't surface those as empty items.
@@ -190,7 +275,7 @@ impl PpqClient {
             } else {
                 Error::UnauthenticatedUpstream {
                     status: status.as_u16(),
-                    body,
+                    body: cap_body(body),
                 }
             });
         };
@@ -231,12 +316,25 @@ impl PpqClientBuilder {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let policy = self.trust_policy.unwrap_or_default();
 
+        // `connect_timeout` bounds the handshake; `read_timeout` bounds a
+        // stalled socket read and resets on every successful one, so it
+        // cannot cut off a long-running but actively-streaming completion —
+        // only a genuinely stuck enclave or CDN. Deliberately no total
+        // `.timeout()`: that applies from connect until the body finishes,
+        // which would kill a legitimately long SSE stream.
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .build()?;
+
         let attestation = attest::attest(&base_url, &policy).await?;
 
         // Cross-check the advertised key config against the attested key. A
         // mismatch means the endpoint is serving a key the hardware never
         // vouched for.
-        let advertised = reqwest::get(format!("{base_url}/private/.well-known/hpke-keys"))
+        let advertised = http
+            .get(format!("{base_url}/private/.well-known/hpke-keys"))
+            .send()
             .await?
             .error_for_status()?
             .bytes()
@@ -249,7 +347,7 @@ impl PpqClientBuilder {
         }
 
         Ok(PpqClient {
-            http: reqwest::Client::new(),
+            http,
             base_url,
             api_key,
             attestation,
@@ -568,9 +666,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decrypts_a_sealed_non_2xx() {
-        // A sealed body authenticated: it *is* enclave output, whatever the
-        // status line says.
+    async fn decrypts_a_sealed_non_2xx_but_surfaces_it_as_an_error() {
+        // A sealed body authenticates: it *is* enclave output, whatever the
+        // status line says. But a non-2xx status means the enclave itself
+        // said no, so it must not come back as `Ok` — a caller doing
+        // `resp["choices"][0]` on a rate-limit error would silently read
+        // `Value::Null` instead of noticing the failure.
         let (sk, pk) = keypair();
         let (base, _) = serve(move |req| {
             let (_, sealed) = enclave(&sk, req, &[br#"{"error":{"message":"rate limited"}}"#]);
@@ -578,11 +679,47 @@ mod tests {
         })
         .await;
 
-        let out = client_for(&base, pk)
+        let err = client_for(&base, pk)
             .chat_completion(serde_json::json!({"model": "private/x"}))
             .await
-            .unwrap();
-        assert_eq!(out["error"]["message"], "rate limited");
+            .expect_err("a sealed non-2xx must not come back as Ok");
+        match err {
+            Error::Enclave { status, body } => {
+                assert_eq!(status, 429);
+                assert!(body.contains("rate limited"), "got: {body}");
+            }
+            other => panic!("wrong variant: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypts_a_sealed_non_2xx_stream_but_surfaces_it_as_an_error() {
+        // Same as above but for the streaming entry point: a sealed non-2xx
+        // must never come back as a stream whose sole item is the decrypted
+        // error body — that reads to a consumer as if it were SSE content.
+        let (sk, pk) = keypair();
+        let (base, _) = serve(move |req| {
+            let (_, sealed) = enclave(&sk, req, &[br#"{"error":{"message":"payment required"}}"#]);
+            http_response(402, &[nonce_header()], &sealed)
+        })
+        .await;
+
+        // `expect_err` needs `T: Debug`, and the `Ok` type here is an opaque
+        // stream, so match manually rather than requiring `Debug` on it.
+        let err = match client_for(&base, pk)
+            .chat_completion_stream(serde_json::json!({"model": "private/x"}))
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a sealed non-2xx must not yield a stream"),
+        };
+        match err {
+            Error::Enclave { status, body } => {
+                assert_eq!(status, 402);
+                assert!(body.contains("payment required"), "got: {body}");
+            }
+            other => panic!("wrong variant: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -673,5 +810,32 @@ mod tests {
             .chat_completion(serde_json::json!("not an object"))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn debug_redacts_the_api_key_on_the_client() {
+        let secret = "sk-super-secret-do-not-leak";
+        let (_, pk) = keypair();
+        let mut client = client_for("http://127.0.0.1:1", pk);
+        client.api_key = secret.to_string();
+
+        let out = format!("{client:?}");
+        assert!(!out.contains(secret), "api key leaked into Debug: {out}");
+        assert!(out.contains("redacted"), "got: {out}");
+        // Other fields stay visible; they are useful for debugging.
+        assert!(out.contains("127.0.0.1:1"), "got: {out}");
+    }
+
+    #[test]
+    fn debug_redacts_the_api_key_on_the_builder() {
+        let secret = "sk-super-secret-do-not-leak";
+        let builder = PpqClient::builder()
+            .api_key(secret)
+            .base_url("http://127.0.0.1:1");
+
+        let out = format!("{builder:?}");
+        assert!(!out.contains(secret), "api key leaked into Debug: {out}");
+        assert!(out.contains("redacted"), "got: {out}");
+        assert!(out.contains("127.0.0.1:1"), "got: {out}");
     }
 }

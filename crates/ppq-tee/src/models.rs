@@ -22,7 +22,11 @@ pub struct Pricing {
 
 #[derive(Deserialize)]
 struct Catalogue {
-    data: Vec<Entry>,
+    /// Deserialized as raw values, not `Vec<Entry>`, so one malformed entry
+    /// (e.g. a wrong-typed field) can be skipped in `parse_private` instead
+    /// of failing the whole catalogue — `#[serde(default)]` only covers
+    /// absent fields, not ones with the wrong type.
+    data: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -49,10 +53,17 @@ struct RawPricing {
 }
 
 /// Keep only the end-to-end encrypted (TEE) models.
+///
+/// Each catalogue entry is parsed independently, and a malformed entry is
+/// skipped rather than failing the whole call: PPQ's catalogue holds many
+/// non-`e2e` entries this crate never uses, and a wrong-typed field on one of
+/// those (outside this crate's control) must not take down discovery for the
+/// `e2e` models that did parse fine.
 pub fn parse_private(json: &str) -> Result<Vec<PrivateModel>> {
     let c: Catalogue = serde_json::from_str(json)?;
     Ok(c.data
         .into_iter()
+        .filter_map(|v| serde_json::from_value::<Entry>(v).ok())
         .filter(|e| e.privacy_level == "e2e")
         .map(|e| {
             let p = e.pricing.unwrap_or(RawPricing {
@@ -106,6 +117,20 @@ mod tests {
     fn tolerates_e2e_entries_without_pricing() {
         let json = r#"{"data":[{"id":"private/x","privacyLevel":"e2e"}]}"#;
         assert_eq!(parse_private(json).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tolerates_a_malformed_non_e2e_entry() {
+        // A single catalogue entry with a wrong-typed field (context_length
+        // should be a number) must not take down discovery for the e2e
+        // entries that parsed fine.
+        let json = r#"{"data":[
+            {"id":"gemini-3.7-flash","privacyLevel":"anon","context_length":"not-a-number"},
+            {"id":"private/glm-5-2","privacyLevel":"e2e","context_length":384000}
+        ]}"#;
+        let m = parse_private(json).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].id, "private/glm-5-2");
     }
 
     #[test]
