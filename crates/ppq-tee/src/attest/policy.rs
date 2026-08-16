@@ -24,6 +24,32 @@ pub struct TrustPolicy {
     ///
     /// `None` disables the check.
     pub max_attestation_age: Option<std::time::Duration>,
+    /// Check the bundle's `enclaveCert` against the report and the claimed
+    /// `domain`: its SubjectPublicKeyInfo must hash to the report's TLS key
+    /// fingerprint, and its subjectAltName must then cover `domain`.
+    ///
+    /// **This establishes that the presented certificate carries the public
+    /// key the attested hardware vouched for, and that the certificate's SAN
+    /// covers the claimed name. It does not establish that the certificate was
+    /// issued by anyone** — its signature is never verified, so an attacker
+    /// holding a genuine bundle can rebuild the certificate around the same
+    /// SubjectPublicKeyInfo with any SAN it likes and still pass. So
+    /// [`crate::attest::Attestation::domain`] is *not* an attested fact with
+    /// this on; it is a misconfiguration and smoke-test guard, never a
+    /// verification result or a basis for policy. See
+    /// [`crate::attest::domain`] for what would make it trustworthy and why
+    /// that is not done.
+    ///
+    /// Off, even that guard is skipped: the server can name any domain it
+    /// likes and verification will not so much as look at the certificate.
+    ///
+    /// On by default — it is the fail-closed choice, and it catches a server
+    /// whose certificate does not match its own claimed domain. It does
+    /// *not* catch a client pointed at a genuine-but-wrong deployment: that
+    /// bundle is internally self-consistent and passes. A caller who needs
+    /// that must compare [`crate::attest::Attestation::domain`] against the
+    /// domain it expected itself.
+    pub check_enclave_certificate: bool,
 }
 
 /// Default bound for [`TrustPolicy::max_attestation_age`]: 90 days.
@@ -37,6 +63,7 @@ impl Default for TrustPolicy {
             oidc_issuer: "https://token.actions.githubusercontent.com".to_string(),
             require_debug_disabled: true,
             max_attestation_age: Some(DEFAULT_MAX_ATTESTATION_AGE),
+            check_enclave_certificate: true,
         }
     }
 }
@@ -80,6 +107,10 @@ mod tests {
         assert_eq!(
             p.max_attestation_age,
             Some(std::time::Duration::from_secs(90 * 24 * 60 * 60))
+        );
+        assert!(
+            p.check_enclave_certificate,
+            "the enclave certificate check is on by default: it is the fail-closed choice"
         );
     }
 

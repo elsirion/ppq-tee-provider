@@ -220,14 +220,14 @@ pub(crate) async fn seal_and_send(
     plaintext: &[u8],
     mut headers: reqwest::header::HeaderMap,
 ) -> Result<(FrameDecoder, reqwest::Response)> {
-    // The bearer token and the sealed body only ever go to the origin we
-    // attested. `starts_with` on the bare base URL would also accept
-    // `https://api.ppq.ai.example.com/...`, so the boundary has to be a path
-    // separator.
+    // The bearer token and the sealed body only ever go to the caller's
+    // configured base URL. `starts_with` on the bare base URL would also
+    // accept `https://api.ppq.ai.example.com/...`, so the boundary has to be
+    // a path separator.
     let base = client.base_url.trim_end_matches('/');
     if !url.starts_with(base) || !url[base.len()..].starts_with('/') {
         return Err(Error::Ehbp(format!(
-            "refusing to seal a request to {url}, which is outside the attested origin {base}"
+            "refusing to seal a request to {url}, which is outside the configured base URL {base}"
         )));
     }
 
@@ -703,12 +703,13 @@ mod tests {
     }
 
     /// `seal_and_send` takes a URL because the `rig` transport gets one from
-    /// rig's own routing rather than building it here. A URL off the attested
-    /// origin would carry the bearer token — and a body sealed to the enclave
-    /// key — somewhere the hardware never vouched for, so it is refused. The
-    /// look-alike host is the case a bare `starts_with` would let through.
+    /// rig's own routing rather than building it here. A URL off the
+    /// caller's configured base URL would carry the bearer token — and a
+    /// body sealed to the enclave key — somewhere the caller never
+    /// configured it to go, so it is refused. The look-alike host is the
+    /// case a bare `starts_with` would let through.
     #[tokio::test]
-    async fn refuses_to_seal_a_request_outside_the_attested_origin() {
+    async fn refuses_to_seal_a_request_outside_the_configured_base_url() {
         let (_, pk) = keypair();
         let client = client_for("https://api.ppq.ai", pk);
 
@@ -719,9 +720,9 @@ mod tests {
             let err = seal_and_send(&client, url, b"{}", Default::default())
                 .await
                 .map(|_| ())
-                .expect_err("only the attested origin may receive a sealed request");
+                .expect_err("only the configured base URL may receive a sealed request");
             assert!(
-                err.to_string().contains("outside the attested origin"),
+                err.to_string().contains("outside the configured base URL"),
                 "got: {err}"
             );
         }

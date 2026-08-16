@@ -166,15 +166,34 @@ What is protected, and what is not:
   `TrustPolicy::max_attestation_age` (default 90 days) against the Rekor
   entry's `integratedTime`. This is inherent to Tinfoil's attestation
   design, not a defect in this crate.
-- **`attestation().domain` is server-reported, not attested.** It is echoed
-  verbatim from the attestation bundle's JSON and nothing binds it to the
-  enclave, so a malicious PPQ could serve a genuine attestation for a real
-  Tinfoil enclave under any domain string it liked. Confidentiality does not
-  depend on it — bodies are sealed to the *attested* HPKE key — but it is not
-  evidence of which deployment answered. Binding it would mean checking the
-  SHA-256 of the `enclaveCert` SubjectPublicKeyInfo against the report's
-  `tls_key_fingerprint`, then that certificate's SAN against `domain`;
-  neither check is implemented.
+- **`attestation().domain` is not attested.** The string is echoed from the
+  attestation bundle's JSON. With `TrustPolicy::check_enclave_certificate` on
+  — the default — verification does check that the SHA-256 of the
+  `enclaveCert` SubjectPublicKeyInfo equals the report's `tls_key_fingerprint`
+  (`report_data[0..32]`), and then that the same certificate's subjectAltName
+  covers `domain` under RFC 6125 rules (case-insensitive, wildcards only as a
+  whole leftmost label matching exactly one label and never over a single-label
+  suffix like `*.com`, `dNSName` entries only, no Common Name fallback). That
+  proves the presented certificate carries the attested public key and that it
+  says it covers the claimed name.
+
+  It does **not** prove the certificate was issued by anyone: nothing verifies
+  its signature. An attacker holding a genuine bundle can rebuild the
+  certificate around that same, byte-identical SubjectPublicKeyInfo, give it
+  any subjectAltName it likes, leave the signature bits garbage, and pass both
+  checks. `report_data[0..32]` binds *key → hardware*; the CA's issuance
+  signature is what would bind *name → key*, and it is not checked. So treat
+  `domain` as a misconfiguration and smoke-test guard — it catches a server
+  that got its own certificate wrong, since the comparison is between the
+  bundle's `domain` and the bundle's own certificate (self-consistency, not
+  attestation) — never as a verification result or a basis for policy. It
+  does *not* catch a client pointed at a genuine-but-wrong deployment: that
+  bundle is internally self-consistent and passes. A caller who needs that
+  must compare `attestation().domain` against the domain it expected itself.
+  Making it trustworthy would mean verifying the certificate chains
+  to a WebPKI root; that is not done because the bundle ships only the leaf (no
+  intermediate) and that leaf rotates roughly every 90 days. Confidentiality
+  never depended on any of it — bodies are sealed to the *attested* HPKE key.
 - **AMD certificate validity periods are not checked.** Documented on
   `verify_chain`: AMD's ARKs run to 2047 and VCEKs are not revoked or rotated
   per-boot, so an expiry check would add no security here while making a
