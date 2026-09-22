@@ -19,9 +19,13 @@
         toolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };
+        # The release build uses the minimal profile: a toolchain carrying
+        # rust-src/rust-docs leaks its own store path into the binary and
+        # drags ~2 GB of toolchain into the runtime closure of the package.
+        buildToolchain = pkgs.rust-bin.stable.latest.minimal;
         rustPlatform = pkgs.makeRustPlatform {
-          cargo = toolchain;
-          rustc = toolchain;
+          cargo = buildToolchain;
+          rustc = buildToolchain;
         };
         manifest = lib.importTOML ./crates/ppq-tee-proxy/Cargo.toml;
       in {
