@@ -126,6 +126,87 @@ Run the example with:
 PPQ_API_KEY=sk-... cargo run -p ppq-tee --features rig --example rig_agent
 ```
 
+## Local OpenAI-compatible proxy
+
+`crates/ppq-tee-proxy` wraps the library in a small daemon that speaks the
+OpenAI HTTP API on localhost, so any OpenAI-compatible client (the openai
+SDKs, aider, Open WebUI, `llm`, editor plugins) can use the TEE models by
+pointing its base URL at the proxy. The proxy holds the PPQ API key; every
+chat completion goes out sealed to the attested enclave key.
+
+| Method | Path | Behaviour |
+| --- | --- | --- |
+| `GET` | `/v1/models` | The TEE-backed models as an OpenAI list object. |
+| `GET` | `/v1/models/{id}` | One model object, or an OpenAI-format 404. |
+| `POST` | `/v1/chat/completions` | Sealed and relayed; `"stream": true` yields `text/event-stream`. |
+
+`GET /v1/models` is the OpenAI API's own model-discovery endpoint, so
+clients find the models without configuration. Each entry carries the
+standard `id`/`object`/`created`/`owned_by` fields plus `name`,
+`context_length` and `pricing` as extensions; `created` is `0` because PPQ's
+catalogue has no creation time. As with the library, the list is discovery
+metadata and not a trust input.
+
+Run it ad hoc:
+
+```bash
+PPQ_API_KEY=sk-... nix run github:elsirion/ppq-tee-provider
+# or, from a checkout: PPQ_API_KEY=sk-... nix run .
+curl http://127.0.0.1:8090/v1/models
+OPENAI_BASE_URL=http://127.0.0.1:8090/v1 OPENAI_API_KEY=unused aider --model openai/private/glm-5-3-flash
+```
+
+Or deploy it as a NixOS service. The key file is read through systemd's
+credential mechanism, so it can be root-only and must not be in the Nix
+store:
+
+```nix
+{
+  inputs.ppq-tee-proxy.url = "github:elsirion/ppq-tee-provider";
+
+  outputs = { nixpkgs, ppq-tee-proxy, ... }: {
+    nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
+      modules = [
+        ppq-tee-proxy.nixosModules.default
+        {
+          services.ppq-tee-proxy = {
+            enable = true;
+            apiKeyFile = "/run/secrets/ppq-api-key"; # e.g. from sops-nix or agenix
+            # listenAddress = "127.0.0.1"; port = 8090; reattestAfter = "1h";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Flags (each also an environment variable): `--listen` (`PPQ_PROXY_LISTEN`,
+default `127.0.0.1:8090`), `--api-key-file` (`PPQ_API_KEY_FILE`; or the key
+itself in `PPQ_API_KEY`), `--base-url` (`PPQ_BASE_URL`), `--reattest-after`
+(`PPQ_REATTEST_AFTER`, default `1h`).
+
+What the proxy adds on top of the library, and what it does not:
+
+- **It re-attests.** The library binds a client to one attested key for its
+  lifetime; the enclave key changes whenever Tinfoil redeploys. The proxy
+  attests at startup, again once the attestation is `--reattest-after` old,
+  and immediately (at most once per 30 s) when a request fails in a way the
+  enclave did not authenticate. A failed request is retried once after
+  re-attestation; an authenticated enclave error is relayed as-is and never
+  retried.
+- **Errors keep OpenAI's shape.** An enclave-authenticated error (rate limit,
+  unknown model) is passed through with its status. Anything that never
+  reached the enclave — a rejection by PPQ's front end, a transport or
+  protocol failure — is a `502` whose message says so; a failed
+  re-attestation is a `503`. Nothing unauthenticated is ever presented as a
+  completion.
+- **It has no client authentication.** Whoever can reach the listening
+  socket can spend the API key, which is why it binds to loopback by
+  default. Put your own auth in front if you expose it further.
+- **Same header caveat as the library.** The bearer token and model id are
+  still visible to PPQ; only bodies are sealed.
+
 ## Running tests
 
 ```bash
