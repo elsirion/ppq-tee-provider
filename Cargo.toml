@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ppq-tee", "crates/xtask"]
+members = ["crates/ppq-tee", "crates/ppq-tee-proxy", "crates/xtask"]
 resolver = "2"
 
 [workspace.package]

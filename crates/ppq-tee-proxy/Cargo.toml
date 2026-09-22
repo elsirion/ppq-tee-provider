@@ -1,0 +1,27 @@
+[package]
+name = "ppq-tee-proxy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Local OpenAI-compatible proxy in front of PPQ.AI's attested TEE models"
+
+[dependencies]
+ppq-tee = { path = "../ppq-tee" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "fs"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+humantime = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# `test-util` gives the paused clock the re-attestation tests drive.
+tokio = { version = "1", features = ["test-util"] }
