@@ -34,8 +34,10 @@ Request and response bodies are then sealed to that key using
 HPKE: X25519-HKDF-SHA256 / HKDF-SHA256 / AES-256-GCM). See
 [Security model](#security-model) below for what this does *not* cover.
 
-Live-verified against `api.ppq.ai` on 2026-08-15: enclave
-`inference.tinfoil.sh`, measurement prefix `6d657b353726893e`.
+Live-verified against `api.ppq.ai` on 2026-09-22: enclave
+`inference.tinfoil.sh`, measurement prefix `5d5c37d9ba597467`. The
+measurement changes with every Tinfoil redeploy; see the proxy section for
+how a long-running process keeps up.
 
 ## Quickstart
 
@@ -53,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let resp = ppq
         .chat_completion(serde_json::json!({
-            "model": "private/glm-5-2",
+            "model": "private/glm-5-3-flash",
             "messages": [{"role": "user", "content": "Name three prime numbers."}],
             "max_tokens": 512,
         }))
@@ -87,7 +89,7 @@ Driving it directly (this is what `examples/rig_agent.rs` does):
 use rig_core::completion::CompletionModel;
 
 let ppq = PpqClient::builder().api_key(api_key).build().await?;
-let model = ppq.completion_model("private/glm-5-2")?;
+let model = ppq.completion_model("private/glm-5-3-flash")?;
 
 let response = model
     .completion_request("Name three prime numbers.")
@@ -112,7 +114,7 @@ rig-agent = "..."
 use rig_agent::completion::Prompt;
 
 let agent = rig_agent::agent::AgentBuilder::new(
-    ppq.completion_model("private/glm-5-2")?
+    ppq.completion_model("private/glm-5-3-flash")?
 )
 .preamble("You are concise.")
 .build();
